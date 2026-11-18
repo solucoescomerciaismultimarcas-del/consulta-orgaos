@@ -203,48 +203,54 @@ def achar_ente(info, esf):
 
 
 def resumo_rp(items):
-    """Soma as colunas da linha total de um anexo de restos a pagar da DCA."""
+    """Le o DCA Anexo I-F (linha Total Despesas) separando processados e nao processados."""
     linhas = {}
     for it in items:
-        conta = it.get("conta") or it.get("cod_conta") or "?"
+        conta = norm(it.get("conta") or it.get("cod_conta") or "?")
         col = norm(it.get("coluna"))
         v = to_num(it.get("valor"))
-        l = linhas.setdefault(conta, {"inscritos": 0.0, "pagos": 0.0, "cancelados": 0.0, "liquidados": 0.0})
+        tipo = "np" if "nao processad" in col else "p" if "processad" in col else None
+        if not tipo:
+            continue
+        l = linhas.setdefault(conta, {"p": {"inscritos": 0.0, "pagos": 0.0, "cancelados": 0.0, "liquidados": 0.0},
+                                      "np": {"inscritos": 0.0, "pagos": 0.0, "cancelados": 0.0, "liquidados": 0.0}})
+        d = l[tipo]
         if "inscrit" in col:
-            l["inscritos"] += v
+            d["inscritos"] += v
         elif "cancelad" in col:
-            l["cancelados"] += v
-        elif "pago" in col:
-            l["pagos"] += v
+            d["cancelados"] += v
         elif "liquidad" in col:
-            l["liquidados"] += v
+            d["liquidados"] += v
+        elif "pago" in col:
+            d["pagos"] += v
     if not linhas:
         return None
-    conta, l = max(linhas.items(), key=lambda kv: kv[1]["inscritos"])
-    if l["inscritos"] <= 0:
-        return None
-    l["linha"] = conta
-    return l
+    total = next((v for k, v in linhas.items() if k.startswith("total")), None)
+    if total is None:
+        total = max(linhas.values(), key=lambda l: l["p"]["inscritos"] + l["np"]["inscritos"])
+    return total
 
 
 def dca_ano(id_ente, ano):
     item = {"ano": ano}
     try:
-        p = resumo_rp(cached(f"dcaG{id_ente}{ano}", 21600, lambda: siconfi(
-            "dca", {"an_exercicio": ano, "no_anexo": "DCA-Anexo I-G", "id_ente": id_ente})))
-        np_ = resumo_rp(cached(f"dcaF{id_ente}{ano}", 21600, lambda: siconfi(
+        r = resumo_rp(cached(f"dcaF{id_ente}{ano}", 21600, lambda: siconfi(
             "dca", {"an_exercicio": ano, "no_anexo": "DCA-Anexo I-F", "id_ente": id_ente})))
     except Exception as e:
         item["erro"] = erro_txt(e)
         return item
-    if p:
+    if not r:
+        return item
+    p, np_ = r["p"], r["np"]
+    if p["inscritos"] > 0:
         saldo = max(p["inscritos"] - p["pagos"] - p["cancelados"], 0)
         item.update(inscritos=p["inscritos"], pagos=p["pagos"], cancelados=p["cancelados"], saldo=saldo,
                     pct_pago=p["pagos"] / p["inscritos"] * 100,
                     pct_cancelado=p["cancelados"] / p["inscritos"] * 100)
-    if np_:
-        item["np"] = {"inscritos": np_["inscritos"], "pagos": np_["pagos"], "cancelados": np_["cancelados"],
-                      "liquidados": np_["liquidados"]}
+    if np_["inscritos"] > 0:
+        item["np"] = dict(np_)
+        if np_["liquidados"] > 0:
+            item["np"]["pct_pago_liquidado"] = np_["pagos"] / np_["liquidados"] * 100
     return item
 
 
@@ -337,22 +343,18 @@ def capag_do_ente(ente):
         return None
     rows = t["rows"]
     hi = None
-    for i, r in enumerate(rows[:25]):
-        n = [norm(x) for x in r]
-        if any("capag" in x for x in n):
+    for i, r in enumerate(rows[:30]):
+        if any(norm(x) == "capag" for x in r):
             hi = i
             break
     if hi is None:
         return None
     hdr = [norm(x) for x in rows[hi]]
     orig = [str(x).strip() for x in rows[hi]]
-    cols_capag = [i for i, h in enumerate(hdr) if "capag" in h]
-    pref = ([i for i in cols_capag if "oficial" in hdr[i] or "final" in hdr[i]]
-            or [i for i in cols_capag if hdr[i] == "capag"] or cols_capag[-1:])
-    col_nota = pref[0]
-    col_ibge = next((i for i, h in enumerate(hdr) if "ibge" in h), None)
-    col_uf = next((i for i, h in enumerate(hdr) if h in ("uf", "sigla", "sigla uf")), None)
-    col_nome = next((i for i, h in enumerate(hdr) if h in ("ente", "nome", "municipio", "estado", "nome do ente")), None)
+    col_nota = hdr.index("capag")
+    col_ibge = next((i for i, h in enumerate(hdr) if "ibge" in h or h.startswith("codigo") or h.startswith("cod")), None)
+    col_uf = next((i for i, h in enumerate(hdr) if h in ("uf", "sigla", "sigla uf", "sigla_uf")), None)
+    col_nome = next((i for i, h in enumerate(hdr) if "nome" in h or h in ("ente", "municipio", "estado")), None)
 
     def bate(r):
         if col_ibge is not None and col_ibge < len(r):
@@ -362,18 +364,21 @@ def capag_do_ente(ente):
         if tipo == "estados" and col_uf is not None and col_uf < len(r):
             if str(r[col_uf]).strip().upper() == ente.get("uf"):
                 return True
-        if col_ibge is None and col_nome is not None and col_nome < len(r):
-            if norm(r[col_nome]) == norm(ente.get("ente")) and (
-                    col_uf is None or str(r[col_uf]).strip().upper() == ente.get("uf")):
-                return True
+        if col_nome is not None and col_nome < len(r) and norm(r[col_nome]) == norm(ente.get("ente")):
+            return col_uf is None or str(r[col_uf]).strip().upper() == ente.get("uf")
         return False
 
+    nomes = {"nota 1": "Endividamento", "nota 2": "Poupança corrente", "nota 3": "Liquidez",
+             "observacao": "Observação", "origem da nota final": "Origem da nota"}
     for r in rows[hi + 1:]:
         if bate(r):
-            det = {orig[i]: str(r[i]).strip() for i in range(min(len(r), len(orig))) if orig[i] and str(r[i]).strip()}
-            nota = str(r[col_nota]).strip() if col_nota < len(r) else ""
-            return {"nota": nota, "coluna": orig[col_nota], "arquivo": t["nome"], "url": t["url"],
-                    "detalhes": dict(list(det.items())[:14])}
+            det = {}
+            for i, h in enumerate(hdr):
+                if h in nomes and i < len(r) and str(r[i]).strip() and h not in [norm(k) for k in det]:
+                    val = str(r[i]).strip()
+                    if not (h == "observacao" and norm(val) == "nenhum"):
+                        det[nomes[h]] = val
+            return {"nota": str(r[col_nota]).strip(), "arquivo": t["nome"], "url": t["url"], "detalhes": det}
     return {"nota": "", "arquivo": t["nome"], "url": t["url"], "detalhes": {},
             "obs": "Ente não encontrado na planilha CAPAG mais recente."}
 
@@ -434,8 +439,14 @@ def avaliar_rp(hist, capag):
     canc = sum(h["cancelados"] for h in rec) / insc * 100
     periodo = f"{rec[0]['ano']}–{rec[-1]['ano']}" if len(rec) > 1 else str(rec[0]["ano"])
     motivos = [f"Pagou {pct:.0f}% das dívidas já liquidadas com fornecedores (restos a pagar processados) em {periodo}."]
+    np_rec = [h["np"] for h in rec if h.get("np") and h["np"].get("liquidados")]
+    if np_rec:
+        liq = sum(n["liquidados"] for n in np_rec)
+        pg = sum(n["pagos"] for n in np_rec)
+        if liq:
+            motivos.append(f"Das despesas antigas que foram entregues e aprovadas durante o ano, pagou {pg / liq * 100:.0f}%.")
     if canc >= 1:
-        motivos.append(f"Cancelou {str(round(canc, 1)).replace('.', ',')}% dessas dívidas. Cancelar despesa já liquidada é sinal de alerta.")
+        motivos.append(f"Cancelou {str(round(canc, 1)).replace('.', ',')}% dessas dívidas sem pagar. Cancelar despesa já entregue é sinal de alerta.")
     if pct >= 85 and canc < 5:
         nivel = "bom"
     elif pct >= 65 and canc < 15:
@@ -538,7 +549,7 @@ def consultar(cnpj, chave=""):
 def diagnostico(ibge, ano):
     """Mostra os dados crus do SICONFI e da CAPAG para conferir a leitura."""
     linhas = [f"DIAGNOSTICO ente={ibge} ano={ano}", ""]
-    for anexo in ("DCA-Anexo I-G", "DCA-Anexo I-F"):
+    for anexo in ("DCA-Anexo I-F",):
         its = siconfi("dca", {"an_exercicio": ano, "no_anexo": anexo, "id_ente": ibge})
         linhas.append(f"== {anexo}: {len(its)} itens")
         if its:
@@ -720,7 +731,7 @@ footer{font-size:12px;color:var(--muted)}
   <section class="card metodo">
     <h2>Como a avaliação é feita</h2>
     <p><b>Restos a pagar processados</b> são despesas em que o fornecedor já entregou e o órgão já aprovou (liquidou), mas o pagamento ficou para o ano seguinte. É a dívida mais direta com quem vende para o governo.</p>
-    <p>Para cada ano, comparamos quanto havia dessa dívida no início do ano com quanto foi <b>pago</b> e quanto foi <b>cancelado</b> (Declaração de Contas Anuais, anexo I-G, no SICONFI). Média dos últimos 3 anos: <b>85% ou mais pago</b> e menos de 5% cancelado é bom pagador; <b>65% a 85%</b> é regular; abaixo disso é alto risco.</p>
+    <p>Para cada ano, comparamos quanto havia dessa dívida no início do ano com quanto foi <b>pago</b> e quanto foi <b>cancelado</b> (Declaração de Contas Anuais, anexo I-F, no SICONFI). Média dos últimos 3 anos: <b>85% ou mais pago</b> e menos de 5% cancelado é bom pagador; <b>65% a 85%</b> é regular; abaixo disso é alto risco.</p>
     <p>A <b>CAPAG</b> é a nota oficial do Tesouro Nacional sobre a capacidade de pagamento de estados e municípios (A é a melhor, D a pior). Uma nota C ou D rebaixa a avaliação.</p>
     <p>Secretarias, autarquias e câmaras usam as contas consolidadas do município ou estado a que pertencem. Para órgãos federais, com a chave do Portal da Transparência, comparamos o valor pago com o liquidado em cada ano.</p>
     <p>A avaliação é uma leitura dos dados públicos e não é uma certificação oficial. Atrasos de um órgão específico podem ser diferentes da média do ente.</p>
@@ -818,13 +829,13 @@ function render(d) {
     html += `<section class="card"><h2>Histórico de pagamento das dívidas com fornecedores</h2>
       ${temDados ? grafico(h) : `<p class="hint">Sem declarações de contas anuais disponíveis para estes anos.</p>`}
       <div class="scroll" style="margin-top:14px"><table>
-      <tr><th>Ano</th><th>Dívida no início do ano</th><th>Pago</th><th>Cancelado</th><th>Ficou para depois</th><th>% pago</th><th>Empenhos antigos ainda não liquidados</th></tr>
+      <tr><th>Ano</th><th>Dívida no início do ano</th><th>Pago</th><th>Cancelado</th><th>Ficou para depois</th><th>% pago</th><th>Reservas antigas (não entregues)</th></tr>
       ${h.slice().reverse().map(x => x.erro ? `<tr><td>${x.ano}</td><td colspan="6" style="text-align:left;color:var(--muted)">não respondeu (${esc(x.erro)})</td></tr>`
         : x.pct_pago == null ? `<tr><td>${x.ano}</td><td colspan="6" style="text-align:left;color:var(--muted)">declaração não entregue ou sem restos a pagar</td></tr>`
         : `<tr><td>${x.ano}</td><td>${brl(x.inscritos)}</td><td>${brl(x.pagos)}</td><td>${brl(x.cancelados)}</td><td>${brl(x.saldo)}</td>
            <td><span class="pill ${nivelDe(x.pct_pago, x.pct_cancelado)}">${pct(x.pct_pago)}</span></td><td>${x.np ? brl(x.np.inscritos) : "—"}</td></tr>`).join("")}
       </table></div>
-      <p class="hint">Fonte: SICONFI, Declaração de Contas Anuais, anexos I-G (processados) e I-F (não processados)${d.ente ? ", ente " + esc(d.ente.nome) : ""}.</p></section>`;
+      <p class="hint">Fonte: SICONFI, Declaração de Contas Anuais, anexo I-F (execução de restos a pagar)${d.ente ? ", ente " + esc(d.ente.nome) : ""}.</p></section>`;
   }
 
   if (d.capag && (d.capag.detalhes && Object.keys(d.capag.detalhes).length || d.capag.obs)) {
