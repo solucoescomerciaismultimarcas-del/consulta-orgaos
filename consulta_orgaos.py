@@ -535,6 +535,39 @@ def consultar(cnpj, chave=""):
     return out
 
 
+def diagnostico(ibge, ano):
+    """Mostra os dados crus do SICONFI e da CAPAG para conferir a leitura."""
+    linhas = [f"DIAGNOSTICO ente={ibge} ano={ano}", ""]
+    for anexo in ("DCA-Anexo I-G", "DCA-Anexo I-F"):
+        its = siconfi("dca", {"an_exercicio": ano, "no_anexo": anexo, "id_ente": ibge})
+        linhas.append(f"== {anexo}: {len(its)} itens")
+        if its:
+            linhas.append("campos: " + ", ".join(sorted(its[0].keys())))
+        vistos = 0
+        for it in its:
+            linhas.append(" | ".join(str(it.get(k, "")) for k in ("instituicao", "cod_conta", "conta", "coluna", "valor")))
+            vistos += 1
+            if vistos >= 60:
+                linhas.append("...")
+                break
+        linhas.append("")
+    tipo = "municipios" if len(str(ibge)) > 2 else "estados"
+    try:
+        t = capag_tabela(tipo)
+    except Exception as e:
+        t = None
+        linhas.append("CAPAG erro: " + erro_txt(e))
+    linhas.append(f"== CAPAG {tipo}: " + (t["nome"] + " " + t["url"] if t else "nao encontrada"))
+    if t:
+        for i, r in enumerate(t["rows"][:8]):
+            linhas.append(f"linha {i}: " + " | ".join(str(x) for x in r))
+        for r in t["rows"]:
+            if any(digitos(str(x).split(".")[0]) in (str(ibge), str(ibge)[:6]) for x in r):
+                linhas.append("ENTE: " + " | ".join(str(x) for x in r))
+                break
+    return "\n".join(linhas)
+
+
 # ----------------------------------------------------------------- servidor
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -549,10 +582,22 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
         if u.path in ("/", "/index.html"):
             return self._send(200, PAGINA, "text/html; charset=utf-8")
+        if u.path == "/diagnostico":
+            q = urllib.parse.parse_qs(u.query)
+            try:
+                txt = diagnostico(q.get("ibge", ["3550308"])[0], q.get("ano", [str(date.today().year - 1)])[0])
+            except Exception as e:
+                txt = "ERRO: " + erro_txt(e)
+            return self._send(200, txt, "text/plain; charset=utf-8")
         if u.path == "/api/consulta":
             q = urllib.parse.parse_qs(u.query)
             try:
