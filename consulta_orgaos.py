@@ -614,10 +614,10 @@ def link_pncp(numero):
 def pncp_pagina(cnpj, ini, fim, pagina, tamanho):
     url = (f"{PNCP}/contratos?dataInicial={ini:%Y%m%d}&dataFinal={fim:%Y%m%d}"
            f"&cnpjOrgao={cnpj}&pagina={pagina}&tamanhoPagina={tamanho}")
-    return http_get(url, timeout=60)
+    return http_get(url, timeout=30)
 
 
-def pncp_contratos(cnpj, dias=365, max_paginas=4):
+def pncp_contratos(cnpj, dias=365, max_paginas=1):
     fim = date.today()
     ini = fim - timedelta(days=dias)
     tamanho = 500
@@ -627,7 +627,7 @@ def pncp_contratos(cnpj, dias=365, max_paginas=4):
         if e.code == 204:
             d = None
         elif e.code == 400:
-            tamanho, max_paginas = 50, 20
+            tamanho, max_paginas = 50, 4
             d = pncp_pagina(cnpj, ini, fim, 1, tamanho)
         else:
             raise
@@ -869,7 +869,10 @@ def pncp_do_orgao(cnpj, ente_cnpj=""):
     try:
         return cached(f"pncp{cnpj}{ente_cnpj}", 6 * 3600, f)
     except Exception as e:
-        return {"erro": f"O PNCP não respondeu ({erro_txt(e)}). Tente de novo em alguns minutos."}
+        msg = erro_txt(e)
+        if "timed out" in msg.lower() or "timeout" in msg.lower():
+            msg = "demorou mais de 30 segundos"
+        return {"erro": f"O PNCP está lento ou fora do ar no momento ({msg}).", "tentar": True}
 
 
 def consultar_rapido(cnpj, chave=""):
@@ -1323,7 +1326,7 @@ function grafico(hist) {
 function statPncp(p) {
   if (!p) return "";
   if (p.carregando) return `<div class="stat"><div class="lb">${ICON.contrato} Contratos no PNCP</div><div class="v c-acc" style="display:flex;align-items:center;gap:8px"><span class="spin" style="width:16px;height:16px"></span></div><div class="s">buscando no PNCP…</div></div>`;
-  if (p.erro) return `<div class="stat"><div class="lb">${ICON.contrato} Contratos no PNCP</div><div class="v c-acc">—</div><div class="s">PNCP indisponível</div></div>`;
+  if (p.erro) return `<div class="stat"><div class="lb">${ICON.contrato} Contratos no PNCP</div><div class="v c-acc">—</div><div class="s">PNCP lento ou fora do ar</div></div>`;
   return `<div class="stat"><div class="lb">${ICON.contrato} Contratos no PNCP</div><div class="v c-acc num">${(p.total || 0).toLocaleString("pt-BR")}</div><div class="s">${brl(p.valor_total)} · 12 meses</div></div>`;
 }
 
@@ -1407,13 +1410,13 @@ function render(d, abaInicial) {
     const p = d.pncp;
     html += `<div class="painel" data-p="contratos" hidden>`;
     if (p.carregando) html += `<div class="carregando"><div class="spin"></div>Buscando os contratos no PNCP. Aparecem aqui em alguns segundos.</div>`;
-    else if (p.erro) html += `<div class="aviso">${esc(p.erro)}</div>`;
+    else if (p.erro) html += `<div class="aviso">${esc(p.erro)} ${p.tentar ? `<button class="btn-o" type="button" id="pncp-de-novo" style="margin-left:8px">Tentar de novo</button>` : ""}</div>`;
     else if (!p.total) html += `<div class="faixa t-neutro">${ICON.alerta}<div><b>Nenhum contrato no PNCP</b><p>Este órgão não publicou contratos no Portal Nacional de Contratações Públicas entre ${esc(data(p.inicio))} e ${esc(data(p.fim))}.</p></div></div>`;
     else {
       html += `${p.obs ? `<div class="aviso">${esc(p.obs)}</div>` : ""}
       <div class="resumo-pncp">
         <div class="mini"><span>Contratos publicados</span><b class="num">${p.total.toLocaleString("pt-BR")}</b></div>
-        <div class="mini"><span>Valor somado${p.somados < p.total ? ` (${p.somados.toLocaleString("pt-BR")} maiores recentes)` : ""}</span><b class="num">${brl(p.valor_total)}</b></div>
+        <div class="mini"><span>Valor somado${p.somados < p.total ? ` (dos ${p.somados.toLocaleString("pt-BR")} contratos lidos)` : ""}</span><b class="num">${brl(p.valor_total)}</b></div>
         <div class="mini"><span>Período</span><b style="font-size:15px">${esc(data(p.inicio))} a ${esc(data(p.fim))}</b></div>
       </div>
       <div class="box"><h4>Maiores fornecedores (por valor)</h4><div class="scroll"><table>
@@ -1468,6 +1471,12 @@ function render(d, abaInicial) {
   document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () => abrir(t.dataset.tab)));
   document.querySelectorAll("[data-ir]").forEach(b => b.addEventListener("click", () => abrir(b.dataset.ir)));
   if (abaInicial && document.querySelector(`.tab[data-tab="${abaInicial}"]`)) abrir(abaInicial);
+  const novo = document.getElementById("pncp-de-novo");
+  if (novo) novo.addEventListener("click", () => {
+    d.pncp = {carregando: true};
+    render(d, "contratos");
+    carregarPncp(d, (d.orgao || {}).cnpj || "");
+  });
 }
 </script>
 </body>
