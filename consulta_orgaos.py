@@ -147,6 +147,8 @@ def consulta_cnpj(c):
                 "endereco": endereco(d),
                 "telefone": d.get("ddd_telefone_1") or "",
                 "email": d.get("email") or "",
+                "efr": d.get("ente_federativo_responsavel") or "",
+                "matriz": str(d.get("identificador_matriz_filial") or "1") == "1",
                 "fonte": url.split("/")[2],
             }
         except Exception as e:  # tenta a próxima fonte
@@ -170,7 +172,68 @@ def esfera_do_orgao(info):
         return "municipal"
     if cod.startswith("1"):
         return "publico"
+    if cod in ESTATAIS:
+        return "estatal"
     return "privado"
+
+
+# Empresa Pública, Sociedade de Economia Mista e equivalentes
+ESTATAIS = {"2011", "2038", "2208"}
+UFS = {"AC", "AL", "AP", "AM", "BA", "CE", "DF", "ES", "GO", "MA", "MT", "MS", "MG", "PA", "PB", "PR",
+       "PE", "PI", "RJ", "RN", "RS", "RO", "RR", "SC", "SP", "SE", "TO"}
+
+
+def cnpj_matriz(c):
+    base = c[:8] + "0001"
+
+    def dv(b, pesos):
+        r = sum(int(a) * p for a, p in zip(b, pesos)) % 11
+        return "0" if r < 2 else str(11 - r)
+
+    p1 = [5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]
+    d1 = dv(base, p1)
+    return base + d1 + dv(base + d1, [6] + p1)
+
+
+def esfera_pelo_efr(efr):
+    """Ente federativo responsável informado na Receita: 'UNIÃO', 'PE' ou 'RECIFE - PE'."""
+    e = norm(efr)
+    if not e:
+        return None, None
+    if e in ("uniao", "brasil", "uniao federal"):
+        return "federal", {}
+    if e.upper() in UFS:
+        return "estadual", {"uf": e.upper()}
+    m = re.match(r"^(.+?)\s*-\s*([a-z]{2})$", e)
+    if m and m.group(2).upper() in UFS:
+        return "municipal", {"municipio": m.group(1), "uf": m.group(2).upper(), "codigo_ibge": ""}
+    return None, None
+
+
+def esfera_da_estatal(info):
+    """Descobre se a empresa estatal é federal, estadual ou municipal."""
+    esf, base = esfera_pelo_efr(info.get("efr"))
+    if esf:
+        return esf, base, "pelo ente responsável informado na Receita Federal"
+    sede = info
+    if not info.get("matriz"):
+        try:
+            sede = consulta_cnpj(cnpj_matriz(info["cnpj"]))
+            esf, base = esfera_pelo_efr(sede.get("efr"))
+            if esf:
+                return esf, base, "pelo ente responsável informado na Receita Federal"
+        except Exception:
+            sede = info
+    nome = norm(info["razao_social"])
+    uf = sede.get("uf", "")
+    if "distrito federal" in nome:
+        return "estadual", {"uf": "DF"}, "pelo nome da empresa"
+    if "municipal" in nome or (sede.get("municipio") and norm(sede["municipio"]) in nome and uf != "DF"):
+        return "municipal", {"municipio": sede.get("municipio", ""), "uf": uf,
+                             "codigo_ibge": sede.get("codigo_ibge", "")}, "pelo nome e pela sede da empresa"
+    if uf == "DF" or "federal" in nome or "brasil" in nome:
+        return "federal", {}, "pela sede da empresa em Brasília"
+    return "estadual", {"uf": uf}, f"pela sede da empresa ({uf})"
 
 
 # ----------------------------------------------------------------- SICONFI
@@ -557,6 +620,24 @@ def consultar(cnpj, chave=""):
                              "Esta ferramenta só analisa órgãos de governo.")
         return out
 
+    base = info
+    if esf == "publico":
+        e2, b2 = esfera_pelo_efr(info.get("efr"))
+        if e2:
+            esf, base = e2, {**info, **b2}
+    if esf == "estatal":
+        esf, b2, motivo = esfera_da_estatal(info)
+        base = {**info, **b2}
+        nome_esf = {"federal": "federal", "estadual": "estadual", "municipal": "municipal"}[esf]
+        out["esfera"] = esf
+        out["tipo"] = f"Empresa estatal {nome_esf}"
+        out["avisos"].append(
+            f"É uma empresa estatal {nome_esf} ({info['natureza_juridica']}), identificada {motivo}. "
+            "A análise usa as contas do governo a que ela pertence. Estatais que se sustentam com receita própria, "
+            "como bancos e a Petrobras, não entram nesses relatórios e podem pagar de forma diferente.")
+    else:
+        out["esfera"] = esf
+
     ano = date.today().year
     anos = list(range(ano - 7, ano))
     ente, como = None, None
@@ -565,7 +646,7 @@ def consultar(cnpj, chave=""):
             ente, como = {"cod_ibge": 1, "ente": "União (Governo Federal)", "esfera": "U", "uf": "BR"}, \
                 "órgão federal: o histórico abaixo é da União como um todo"
         else:
-            ente, como = achar_ente(info, esf)
+            ente, como = achar_ente(base, esf)
     except Exception as e:
         out["avisos"].append(f"Não consegui acessar o SICONFI do Tesouro ({erro_txt(e)}). Tente de novo em alguns minutos.")
 
@@ -953,7 +1034,7 @@ function render(d) {
   let html = `<section class="ficha">`;
   for (const av of d.avisos || []) html += `<div class="aviso">${esc(av)}</div>`;
   html += `<div class="cab"><div class="cab-t"><h2>${esc(o.razao_social)}</h2><div class="sub">${sub}</div></div>
-    <div class="badges"><span class="badge">${esc(ESFERA[d.esfera] || "Órgão")} ${ICON.predio}</span>
+    <div class="badges"><span class="badge">${esc(d.tipo || ESFERA[d.esfera] || "Órgão")} ${ICON.predio}</span>
     ${o.situacao ? `<span class="badge ${ativa ? "ok" : "no"}">${esc(o.situacao.toUpperCase())}</span>` : ""}</div></div>`;
 
   if (a) {
