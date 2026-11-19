@@ -460,25 +460,74 @@ def capag_do_ente(ente):
 
 
 # ----------------------------------------------------------------- Federal (com chave)
+PARADAS = {"de", "da", "do", "das", "dos", "e", "em", "para", "a", "o"}
+
+
+def palavras(txt):
+    return [w for w in re.findall(r"[a-z0-9]+", norm(txt)) if w not in PARADAS and len(w) > 1]
+
+
+def parecido(a, b):
+    """Semelhança entre nomes, tolerando abreviações do SIAFI (DESENV., CIA, S.FRANCISCO)."""
+    A, B = palavras(a), palavras(b)
+    if not A or not B:
+        return 0.0
+    sin = {"cia": "companhia", "univ": "universidade", "fed": "federal", "inst": "instituto", "min": "ministerio"}
+    A = [sin.get(w, w) for w in A]
+    B = [sin.get(w, w) for w in B]
+
+    def casa(x, Y):
+        return any(x == y or (len(x) >= 3 and len(y) >= 3 and (x.startswith(y) or y.startswith(x))) for y in Y)
+
+    return (sum(casa(x, B) for x in A) / len(A) + sum(casa(y, A) for y in B) / len(B)) / 2
+
+
+def portal_orgaos(termo, H):
+    r = http_get(f"{PORTAL}/orgaos-siafi?" + urllib.parse.urlencode({"descricao": termo, "pagina": 1}), H)
+    return [c for c in (r or []) if c.get("codigo")]
+
+
+def achar_orgao_siafi(info, H):
+    nome = info["razao_social"]
+    sigla = norm(info.get("nome_fantasia"))
+    termos = [nome]
+    if sigla and len(sigla) <= 15:
+        termos.append(info["nome_fantasia"])
+    longas = sorted(set(w for w in palavras(nome) if len(w) >= 5), key=len, reverse=True)
+    termos += [w.upper() for w in longas[:4]]
+    vistos = {}
+    for termo in termos:
+        for c in portal_orgaos(termo, H):
+            vistos[str(c["codigo"])] = c
+        melhor = max(vistos.values(), key=lambda c: parecido(nome, c.get("descricao")), default=None)
+        if melhor and parecido(nome, melhor.get("descricao")) >= 0.8:
+            break
+        time.sleep(0.3)
+    if not vistos:
+        return None, []
+    ordem = sorted(vistos.values(), key=lambda c: (parecido(nome, c.get("descricao"))
+                                                    + (0.3 if sigla and sigla in norm(c.get("descricao")) else 0)),
+                   reverse=True)
+    alvo = ordem[0]
+    nota = parecido(nome, alvo.get("descricao")) + (0.3 if sigla and sigla in norm(alvo.get("descricao")) else 0)
+    return (alvo if nota >= 0.55 else None), ordem[:6]
+
+
 def federal(info, chave):
     H = {"chave-api-dados": chave}
     nome = info["razao_social"]
-    candidatos = []
-    for termo in (nome, " ".join(nome.split()[:4])):
-        try:
-            r = http_get(f"{PORTAL}/orgaos-siafi?" + urllib.parse.urlencode({"descricao": termo, "pagina": 1}), H)
-        except urllib.error.HTTPError as e:
-            if e.code in (401, 403):
-                return {"erro": "A chave do Portal da Transparência foi recusada. Confira se copiou a chave certa."}
-            return {"erro": f"Portal da Transparência respondeu {erro_txt(e)}."}
-        except Exception as e:
-            return {"erro": f"Portal da Transparência indisponível: {erro_txt(e)}."}
-        candidatos = [c for c in (r or []) if c.get("codigo")]
-        if candidatos:
-            break
-    if not candidatos:
-        return {"erro": f"Não encontrei '{nome}' na lista de órgãos do SIAFI."}
-    alvo = next((c for c in candidatos if norm(c.get("descricao")) == norm(nome)), candidatos[0])
+    try:
+        alvo, candidatos = cached("siafi" + info["cnpj"], 86400, lambda: achar_orgao_siafi(info, H))
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return {"erro": "A chave do Portal da Transparência foi recusada. Confira se copiou a chave certa."}
+        return {"erro": f"Portal da Transparência respondeu {erro_txt(e)}."}
+    except Exception as e:
+        return {"erro": f"Portal da Transparência indisponível: {erro_txt(e)}."}
+    if not alvo:
+        parecidos = "; ".join(f"{c.get('codigo')} {c.get('descricao')}" for c in candidatos[:4])
+        return {"erro": f"Não encontrei '{nome}' na lista de órgãos do SIAFI."
+                        + (f" Nomes parecidos: {parecidos}." if parecidos else "")}
     cod = str(alvo["codigo"])
     hist = []
     ano_atual = date.today().year
@@ -720,6 +769,52 @@ def diagnostico(ibge, ano):
     return "\n".join(linhas)
 
 
+def diagnostico_federal(cnpj):
+    """Mostra o que o Portal da Transparência responde, sem expor a chave."""
+    chave = os.environ.get("PORTAL_TRANSPARENCIA_CHAVE", "")
+    if not chave:
+        return "Sem chave configurada no servidor."
+    H = {"chave-api-dados": chave}
+    info = consulta_cnpj(digitos(cnpj))
+    linhas = [f"DIAGNOSTICO FEDERAL {info['cnpj']} {info['razao_social']} ({info.get('nome_fantasia')})", ""]
+    testes = [{"pagina": 1}, {"descricao": info["razao_social"], "pagina": 1}]
+    if info.get("nome_fantasia"):
+        testes.append({"descricao": info["nome_fantasia"], "pagina": 1})
+    for w in sorted(set(w for w in palavras(info["razao_social"]) if len(w) >= 5), key=len, reverse=True)[:3]:
+        testes.append({"descricao": w.upper(), "pagina": 1})
+    for t in testes:
+        url = f"{PORTAL}/orgaos-siafi?" + urllib.parse.urlencode(t)
+        try:
+            r = http_get(url, H)
+            linhas.append(f"== orgaos-siafi {t}: {len(r or [])} itens")
+            for c in (r or [])[:8]:
+                linhas.append("   " + json.dumps(c, ensure_ascii=False)[:300])
+        except Exception as e:
+            linhas.append(f"== orgaos-siafi {t}: ERRO {erro_txt(e)}")
+        time.sleep(0.4)
+    try:
+        alvo, cands = achar_orgao_siafi(info, H)
+        linhas.append("")
+        linhas.append("ESCOLHIDO: " + (json.dumps(alvo, ensure_ascii=False) if alvo else "nenhum"))
+        for c in cands:
+            linhas.append(f"   {parecido(info['razao_social'], c.get('descricao')):.2f}  {c.get('codigo')} {c.get('descricao')}")
+        if alvo:
+            ano = date.today().year - 1
+            for param in ("orgao", "orgaoSuperior"):
+                url = f"{PORTAL}/despesas/por-orgao?" + urllib.parse.urlencode({"ano": ano, param: alvo["codigo"], "pagina": 1})
+                try:
+                    r = http_get(url, H)
+                    linhas.append(f"== despesas/por-orgao {param}={alvo['codigo']} ano={ano}: {len(r or [])} itens")
+                    for c in (r or [])[:5]:
+                        linhas.append("   " + json.dumps(c, ensure_ascii=False)[:400])
+                except Exception as e:
+                    linhas.append(f"== despesas/por-orgao {param}: ERRO {erro_txt(e)}")
+                time.sleep(0.4)
+    except Exception as e:
+        linhas.append("busca: ERRO " + erro_txt(e))
+    return "\n".join(linhas)
+
+
 # ----------------------------------------------------------------- servidor
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -747,6 +842,13 @@ class Handler(BaseHTTPRequestHandler):
             q = urllib.parse.parse_qs(u.query)
             try:
                 txt = diagnostico(q.get("ibge", ["3550308"])[0], q.get("ano", [str(date.today().year - 1)])[0])
+            except Exception as e:
+                txt = "ERRO: " + erro_txt(e)
+            return self._send(200, txt, "text/plain; charset=utf-8")
+        if u.path == "/diagnostico-federal":
+            q = urllib.parse.parse_qs(u.query)
+            try:
+                txt = diagnostico_federal(q.get("cnpj", ["00399857000126"])[0])
             except Exception as e:
                 txt = "ERRO: " + erro_txt(e)
             return self._send(200, txt, "text/plain; charset=utf-8")
