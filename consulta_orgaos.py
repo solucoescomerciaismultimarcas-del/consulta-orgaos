@@ -36,13 +36,14 @@ import webbrowser
 import xml.etree.ElementTree as ET
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date
+from datetime import date, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("PORT", "8000"))
 SICONFI = "https://apidatalake.tesouro.gov.br/ords/siconfi/tt"
 PORTAL = "https://api.portaldatransparencia.gov.br/api-de-dados"
 CKAN = "https://www.tesourotransparente.gov.br/ckan/api/3/action/package_show?id="
+PNCP = "https://pncp.gov.br/api/consulta/v1"
 UA = "consulta-pagador-publico/1.0"
 
 _cache = {}
@@ -59,6 +60,8 @@ def http_get(url, headers=None, timeout=45, raw=False):
         data = r.read()
     if raw:
         return data
+    if not data.strip():
+        return None
     return json.loads(data.decode("utf-8"))
 
 
@@ -589,6 +592,79 @@ def federal(info, chave):
             "historico": hist}
 
 
+# ----------------------------------------------------------------- PNCP
+def _campo(d, *nomes):
+    for n in nomes:
+        v = d.get(n) if isinstance(d, dict) else None
+        if v not in (None, ""):
+            return v
+    return None
+
+
+def link_pncp(numero):
+    """'00394460000141-2-000123/2024' -> página do contrato no PNCP."""
+    m = re.match(r"^(\d{14})-\d+-(\d+)/(\d{4})$", str(numero or ""))
+    if not m:
+        return ""
+    return f"https://pncp.gov.br/app/contratos/{m.group(1)}/{m.group(3)}/{int(m.group(2))}"
+
+
+def pncp_pagina(cnpj, ini, fim, pagina, tamanho):
+    url = (f"{PNCP}/contratos?dataInicial={ini:%Y%m%d}&dataFinal={fim:%Y%m%d}"
+           f"&cnpjOrgao={cnpj}&pagina={pagina}&tamanhoPagina={tamanho}")
+    return http_get(url, timeout=60)
+
+
+def pncp_contratos(cnpj, dias=365, max_paginas=10):
+    fim = date.today()
+    ini = fim - timedelta(days=dias)
+    itens, total, tamanho, pagina = [], 0, 500, 1
+    while pagina <= max_paginas:
+        try:
+            d = pncp_pagina(cnpj, ini, fim, pagina, tamanho)
+        except urllib.error.HTTPError as e:
+            if e.code == 400 and tamanho == 500:
+                tamanho = 50
+                max_paginas = 40
+                continue
+            if e.code == 204:
+                break
+            raise
+        if not d:
+            break
+        lst = d.get("data") or []
+        total = d.get("totalRegistros") or total or len(lst)
+        itens += lst
+        if not lst or (d.get("paginasRestantes") or 0) <= 0:
+            break
+        pagina += 1
+    contratos, fornecedores = [], {}
+    valor_total = 0.0
+    for c in itens:
+        valor = to_num(_campo(c, "valorGlobal", "valorInicial", "valorParcela"))
+        valor_total += valor
+        nome = _campo(c, "nomeRazaoSocialFornecedor", "nomeFornecedor") or "Não informado"
+        doc = digitos(_campo(c, "niFornecedor", "cnpjFornecedor"))
+        f = fornecedores.setdefault(doc or nome, {"nome": nome, "doc": doc, "contratos": 0, "valor": 0.0})
+        f["contratos"] += 1
+        f["valor"] += valor
+        unidade = _campo(c.get("unidadeOrgao") or {}, "nomeUnidade")
+        contratos.append({
+            "assinatura": str(_campo(c, "dataAssinatura", "dataPublicacaoPncp") or "")[:10],
+            "fim": str(_campo(c, "dataVigenciaFim") or "")[:10],
+            "fornecedor": nome, "doc": doc,
+            "objeto": str(_campo(c, "objetoContrato", "objeto") or "")[:400],
+            "valor": valor,
+            "tipo": _campo(c.get("tipoContrato") or {}, "nome") or "",
+            "unidade": unidade or "",
+            "link": link_pncp(_campo(c, "numeroControlePNCP")),
+        })
+    contratos.sort(key=lambda x: x["assinatura"], reverse=True)
+    top = sorted(fornecedores.values(), key=lambda f: f["valor"], reverse=True)[:10]
+    return {"cnpj": cnpj, "inicio": ini.isoformat(), "fim": fim.isoformat(), "total": total or len(itens),
+            "somados": len(itens), "valor_total": valor_total, "contratos": contratos[:60], "fornecedores": top}
+
+
 # ----------------------------------------------------------------- avaliação
 TITULOS = {"bom": "Bom pagador", "regular": "Pagador regular", "ruim": "Mau pagador", "sem_dados": "Sem dados suficientes"}
 
@@ -706,6 +782,9 @@ def consultar(cnpj, chave=""):
                              "Esta ferramenta só analisa órgãos de governo.")
         return out
 
+    _pool = ThreadPoolExecutor(max_workers=1)
+    f_pncp = _pool.submit(pncp_contratos, c)
+
     base = info
     if esf == "publico":
         e2, b2 = esfera_pelo_efr(info.get("efr"))
@@ -770,6 +849,23 @@ def consultar(cnpj, chave=""):
         av = avaliar_federal(out["federal"])
         if av:
             out["avaliacao"] = av
+            if out.get("ente"):
+                out["ente"]["nome"] = out["federal"]["orgao_siafi"]["descricao"]
+                out["ente"]["como"] = ("a nota usa os pagamentos do próprio órgão, na aba Pagamentos federais; "
+                                       "a aba Histórico mostra a União como um todo")
+
+    try:
+        out["pncp"] = f_pncp.result()
+        ente_cnpj = digitos((ente or {}).get("cnpj")) if isinstance(ente, dict) else ""
+        if out["pncp"]["total"] == 0 and ente_cnpj and ente_cnpj != c and esf != "federal":
+            r2 = pncp_contratos(ente_cnpj)
+            if r2["total"]:
+                r2["obs"] = ("Este CNPJ não tem contratos próprios no PNCP. Mostramos os contratos publicados "
+                             "pelo CNPJ principal do ente, que costuma contratar em nome das secretarias e fundos.")
+                out["pncp"] = r2
+    except Exception as e:
+        out["pncp"] = {"erro": f"O PNCP não respondeu ({erro_txt(e)}). Tente de novo em alguns minutos."}
+    _pool.shutdown(wait=False)
     return out
 
 
@@ -876,6 +972,16 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 txt = "ERRO: " + erro_txt(e)
             return self._send(200, txt, "text/plain; charset=utf-8")
+        if u.path == "/diagnostico-pncp":
+            q = urllib.parse.parse_qs(u.query)
+            cn = digitos(q.get("cnpj", ["46395000000139"])[0])
+            fim = date.today()
+            try:
+                d = pncp_pagina(cn, fim - timedelta(days=365), fim, 1, 10)
+                txt = json.dumps(d, ensure_ascii=False, indent=1)[:12000] if d else "resposta vazia (sem contratos)"
+            except Exception as e:
+                txt = "ERRO: " + erro_txt(e)
+            return self._send(200, txt, "text/plain; charset=utf-8")
         if u.path == "/api/consulta":
             q = urllib.parse.parse_qs(u.query)
             try:
@@ -953,7 +1059,7 @@ details.chv .campo{margin-top:10px}
 .badge{display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:600;padding:5px 12px;border-radius:999px;background:var(--accent-soft);color:var(--accent);white-space:nowrap}
 .badge.ok{background:var(--good-bg);color:var(--good)} .badge.no{background:var(--bad-bg);color:var(--bad)}
 hr.sep{border:0;border-top:1px solid var(--line);margin:0}
-.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:18px}
+.stats{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:18px}
 .stat .lb{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:13px}
 .stat .v{font-size:22px;font-weight:800;margin-top:4px;line-height:1.2}
 .stat .s{color:var(--muted);font-size:12.5px;margin-top:2px}
@@ -1008,6 +1114,10 @@ table{border-collapse:collapse;width:100%;font-size:14px;font-variant-numeric:ta
 th,td{padding:9px 10px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}
 th:first-child,td:first-child{text-align:left}
 th{font-size:12px;font-weight:600;color:var(--muted)}
+td.obj{white-space:normal;text-align:left;min-width:300px;max-width:440px;font-size:13px;color:var(--muted)}
+td.forn{white-space:normal;text-align:left;min-width:200px;max-width:280px}
+td.forn small{display:block;color:var(--dim);font-size:12px}
+.resumo-pncp{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}
 .pill{display:inline-block;padding:2px 9px;border-radius:999px;font-weight:700;font-size:12.5px;background:var(--bg-c);color:var(--c)}
 .capag-big{display:flex;gap:18px;align-items:center;flex-wrap:wrap}
 .capag-big .letra{width:84px;height:84px;border-radius:16px;display:grid;place-items:center;font-size:40px;font-weight:800;background:var(--bg-c);color:var(--c);border:1px solid var(--line-c)}
@@ -1032,6 +1142,7 @@ footer{font-size:12px;color:var(--dim)}
 
 @media (max-width:760px){
   .stats{grid-template-columns:repeat(2,minmax(0,1fr))}
+  td.obj{min-width:220px}
   .score{grid-template-columns:1fr}
   .badges{justify-content:flex-start}
 }
@@ -1095,6 +1206,7 @@ const ICON = {
   doc:'<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 3H6v18h12V7l-4-4z"/><path d="M9 13h6M9 17h6"/></svg>',
   moeda:'<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M15 9.5c-.5-1-1.6-1.5-3-1.5-1.7 0-3 .8-3 2s1.3 1.7 3 2 3 .8 3 2-1.3 2-3 2c-1.4 0-2.5-.5-3-1.5M12 6v12"/></svg>',
   predio:'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 21h18M4 10h16M12 3l8 5H4l8-5zM6 10v8M10 10v8M14 10v8M18 10v8"/></svg>',
+  contrato:'<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 3H6v18h12V7l-4-4z"/><path d="M14 3v4h4M9 12h6M9 16h4"/></svg>',
   brilho:'<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l1.8 5.2L19 9l-5.2 1.8L12 16l-1.8-5.2L5 9l5.2-1.8zM19 14l.9 2.1L22 17l-2.1.9L19 20l-.9-2.1L16 17l2.1-.9z"/></svg>'
 };
 
@@ -1150,6 +1262,12 @@ function grafico(hist) {
   return s + `</svg><div class="legend"><span><i style="background:var(--good)"></i>Pago</span><span><i style="background:var(--dim)"></i>Cancelado sem pagar</span><span>Linhas tracejadas: 85% (bom) e 65% (mínimo regular)</span></div>`;
 }
 
+function statPncp(p) {
+  if (!p) return "";
+  if (p.erro) return `<div class="stat"><div class="lb">${ICON.contrato} Contratos no PNCP</div><div class="v c-acc">—</div><div class="s">PNCP indisponível</div></div>`;
+  return `<div class="stat"><div class="lb">${ICON.contrato} Contratos no PNCP</div><div class="v c-acc num">${(p.total || 0).toLocaleString("pt-BR")}</div><div class="s">${brl(p.valor_total)} · 12 meses</div></div>`;
+}
+
 function render(d) {
   const o = d.orgao || {}, a = d.avaliacao, h = d.historico || [], cap = d.capag;
   const nv = a ? a.nivel : "sem_dados";
@@ -1169,12 +1287,16 @@ function render(d) {
       <div class="stat"><div class="lb">${ICON.barras} Nota do órgão</div><div class="v c-${nv} num">${a.score == null ? "—" : a.score + " · " + esc(a.titulo.split(" ")[0])}</div><div class="s">de 0 a 100</div></div>
       <div class="stat"><div class="lb">${ICON.doc} Nota CAPAG</div><div class="v c-acc">${esc((cap && cap.nota) || "—")}</div><div class="s">Tesouro Nacional</div></div>
       <div class="stat"><div class="lb">${ICON.moeda} Contas pagas</div><div class="v c-acc num">${pct(a.pct_pago)}</div><div class="s">${esc(a.periodo || "")}</div></div>
+      ${statPncp(d.pncp)}
     </div><hr class="sep">`;
+  } else if (d.pncp && !d.pncp.erro) {
+    html += `<hr class="sep"><div class="stats">${statPncp(d.pncp)}</div><hr class="sep">`;
   }
 
   const abas = [["resumo","Resumo"]];
   if (h.length) abas.push(["historico","Histórico"]);
   if (d.federal) abas.push(["federal","Pagamentos federais"]);
+  if (d.pncp) abas.push(["contratos","Contratos"]);
   if (cap) abas.push(["capag","Nota CAPAG"]);
   if ((d.entregas || []).some(e => !e.erro)) abas.push(["relatorios","Relatórios"]);
   abas.push(["cadastro","Cadastro"]);
@@ -1219,6 +1341,33 @@ function render(d) {
       <div class="scroll"><table><tr><th>Ano</th><th>Empenhado</th><th>Liquidado</th><th>Pago</th><th>% pago</th></tr>
       ${f.historico.map(x => `<tr><td>${x.ano}${x.parcial ? " (parcial)" : ""}</td><td>${brl(x.empenhado)}</td><td>${brl(x.liquidado)}</td><td>${brl(x.pago)}</td><td>${pct(x.pct_pago)}</td></tr>`).join("")}
       </table></div>`}</div>`;
+  }
+
+  // Contratos PNCP
+  if (d.pncp) {
+    const p = d.pncp;
+    html += `<div class="painel" data-p="contratos" hidden>`;
+    if (p.erro) html += `<div class="aviso">${esc(p.erro)}</div>`;
+    else if (!p.total) html += `<div class="faixa t-neutro">${ICON.alerta}<div><b>Nenhum contrato no PNCP</b><p>Este órgão não publicou contratos no Portal Nacional de Contratações Públicas entre ${esc(data(p.inicio))} e ${esc(data(p.fim))}.</p></div></div>`;
+    else {
+      html += `${p.obs ? `<div class="aviso">${esc(p.obs)}</div>` : ""}
+      <div class="resumo-pncp">
+        <div class="mini"><span>Contratos publicados</span><b class="num">${p.total.toLocaleString("pt-BR")}</b></div>
+        <div class="mini"><span>Valor somado${p.somados < p.total ? ` (${p.somados.toLocaleString("pt-BR")} maiores recentes)` : ""}</span><b class="num">${brl(p.valor_total)}</b></div>
+        <div class="mini"><span>Período</span><b style="font-size:15px">${esc(data(p.inicio))} a ${esc(data(p.fim))}</b></div>
+      </div>
+      <div class="box"><h4>Fornecedores com mais contratos</h4><div class="scroll"><table>
+        <tr><th>Fornecedor</th><th>Contratos</th><th>Valor somado</th></tr>
+        ${p.fornecedores.map(f => `<tr><td class="forn">${esc(f.nome)}${f.doc ? `<small>${esc(f.doc.length === 14 ? mascara(f.doc) : f.doc)}</small>` : ""}</td><td>${f.contratos}</td><td>${brl(f.valor)}</td></tr>`).join("")}
+      </table></div></div>
+      <div class="box"><h4>Contratos mais recentes</h4><div class="scroll"><table>
+        <tr><th>Assinatura</th><th style="text-align:left">Fornecedor</th><th style="text-align:left">Objeto</th><th>Valor</th><th>Vigência até</th><th></th></tr>
+        ${p.contratos.map(k => `<tr><td>${esc(data(k.assinatura))}</td><td class="forn">${esc(k.fornecedor)}</td><td class="obj">${esc(k.objeto)}</td><td>${brl(k.valor)}</td><td>${esc(data(k.fim))}</td>
+          <td>${k.link ? `<a href="${esc(k.link)}" target="_blank" rel="noopener">Ver no PNCP</a>` : ""}</td></tr>`).join("")}
+      </table></div></div>
+      <p class="hint" style="margin:0">Fonte: PNCP, Portal Nacional de Contratações Públicas. Mostra os contratos publicados nos últimos 12 meses.</p>`;
+    }
+    html += `</div>`;
   }
 
   // CAPAG
