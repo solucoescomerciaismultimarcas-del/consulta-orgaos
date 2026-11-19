@@ -351,44 +351,35 @@ def entregas(id_ente, ano):
 
 
 # ----------------------------------------------------------------- CAPAG
-def ler_xlsx(raw, max_colunas=40):
-    """Lê a primeira planilha aos poucos (iterparse), sem montar o arquivo inteiro na memória."""
+def ler_xlsx(raw):
     z = zipfile.ZipFile(io.BytesIO(raw))
     m = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
     ss = []
     if "xl/sharedStrings.xml" in z.namelist():
-        with z.open("xl/sharedStrings.xml") as f:
-            for _, el in ET.iterparse(f):
-                if el.tag == m + "si":
-                    ss.append("".join(t.text or "" for t in el.iter(m + "t")))
-                    el.clear()
+        root = ET.fromstring(z.read("xl/sharedStrings.xml"))
+        for si in root.findall(m + "si"):
+            ss.append("".join(t.text or "" for t in si.iter(m + "t")))
     folhas = sorted((n for n in z.namelist() if re.match(r"xl/worksheets/sheet\d+\.xml$", n)),
                     key=lambda n: int(re.search(r"(\d+)\.xml$", n).group(1)))
+    root = ET.fromstring(z.read(folhas[0]))
     rows = []
-    with z.open(folhas[0]) as f:
-        for _, row in ET.iterparse(f):
-            if row.tag != m + "row":
-                continue
-            vals = {}
-            for c in row.findall(m + "c"):
-                ref = re.match(r"[A-Z]+", c.get("r", "A"))
-                idx = 0
-                for ch in ref.group(0):
-                    idx = idx * 26 + ord(ch) - 64
-                if idx > max_colunas:
-                    continue
-                t, v = c.get("t"), c.find(m + "v")
-                if t == "s" and v is not None:
-                    val = ss[int(v.text)]
-                elif t == "inlineStr":
-                    val = "".join(x.text or "" for x in c.iter(m + "t"))
-                else:
-                    val = v.text if v is not None else ""
-                vals[idx - 1] = val
-            row.clear()
-            if vals:
-                rows.append([vals.get(i, "") for i in range(max(vals) + 1)])
-    del ss
+    for row in root.iter(m + "row"):
+        vals = {}
+        for c in row.findall(m + "c"):
+            ref = re.match(r"[A-Z]+", c.get("r", "A"))
+            idx = 0
+            for ch in ref.group(0):
+                idx = idx * 26 + ord(ch) - 64
+            t, v = c.get("t"), c.find(m + "v")
+            if t == "s" and v is not None:
+                val = ss[int(v.text)]
+            elif t == "inlineStr":
+                val = "".join(x.text or "" for x in c.iter(m + "t"))
+            else:
+                val = v.text if v is not None else ""
+            vals[idx - 1] = val
+        if vals:
+            rows.append([vals.get(i, "") for i in range(max(vals) + 1)])
     return rows
 
 
@@ -623,10 +614,10 @@ def link_pncp(numero):
 def pncp_pagina(cnpj, ini, fim, pagina, tamanho):
     url = (f"{PNCP}/contratos?dataInicial={ini:%Y%m%d}&dataFinal={fim:%Y%m%d}"
            f"&cnpjOrgao={cnpj}&pagina={pagina}&tamanhoPagina={tamanho}")
-    return http_get(url, timeout=30)
+    return http_get(url, timeout=60)
 
 
-def pncp_contratos(cnpj, dias=365, max_paginas=1):
+def pncp_contratos(cnpj, dias=365, max_paginas=4):
     fim = date.today()
     ini = fim - timedelta(days=dias)
     tamanho = 500
@@ -636,7 +627,7 @@ def pncp_contratos(cnpj, dias=365, max_paginas=1):
         if e.code == 204:
             d = None
         elif e.code == 400:
-            tamanho, max_paginas = 50, 4
+            tamanho, max_paginas = 50, 20
             d = pncp_pagina(cnpj, ini, fim, 1, tamanho)
         else:
             raise
@@ -878,10 +869,7 @@ def pncp_do_orgao(cnpj, ente_cnpj=""):
     try:
         return cached(f"pncp{cnpj}{ente_cnpj}", 6 * 3600, f)
     except Exception as e:
-        msg = erro_txt(e)
-        if "timed out" in msg.lower() or "timeout" in msg.lower():
-            msg = "demorou mais de 30 segundos"
-        return {"erro": f"O PNCP está lento ou fora do ar no momento ({msg}).", "tentar": True}
+        return {"erro": f"O PNCP não respondeu ({erro_txt(e)}). Tente de novo em alguns minutos."}
 
 
 def consultar_rapido(cnpj, chave=""):
@@ -1335,7 +1323,7 @@ function grafico(hist) {
 function statPncp(p) {
   if (!p) return "";
   if (p.carregando) return `<div class="stat"><div class="lb">${ICON.contrato} Contratos no PNCP</div><div class="v c-acc" style="display:flex;align-items:center;gap:8px"><span class="spin" style="width:16px;height:16px"></span></div><div class="s">buscando no PNCP…</div></div>`;
-  if (p.erro) return `<div class="stat"><div class="lb">${ICON.contrato} Contratos no PNCP</div><div class="v c-acc">—</div><div class="s">PNCP lento ou fora do ar</div></div>`;
+  if (p.erro) return `<div class="stat"><div class="lb">${ICON.contrato} Contratos no PNCP</div><div class="v c-acc">—</div><div class="s">PNCP indisponível</div></div>`;
   return `<div class="stat"><div class="lb">${ICON.contrato} Contratos no PNCP</div><div class="v c-acc num">${(p.total || 0).toLocaleString("pt-BR")}</div><div class="s">${brl(p.valor_total)} · 12 meses</div></div>`;
 }
 
@@ -1419,13 +1407,13 @@ function render(d, abaInicial) {
     const p = d.pncp;
     html += `<div class="painel" data-p="contratos" hidden>`;
     if (p.carregando) html += `<div class="carregando"><div class="spin"></div>Buscando os contratos no PNCP. Aparecem aqui em alguns segundos.</div>`;
-    else if (p.erro) html += `<div class="aviso">${esc(p.erro)} ${p.tentar ? `<button class="btn-o" type="button" id="pncp-de-novo" style="margin-left:8px">Tentar de novo</button>` : ""}</div>`;
+    else if (p.erro) html += `<div class="aviso">${esc(p.erro)}</div>`;
     else if (!p.total) html += `<div class="faixa t-neutro">${ICON.alerta}<div><b>Nenhum contrato no PNCP</b><p>Este órgão não publicou contratos no Portal Nacional de Contratações Públicas entre ${esc(data(p.inicio))} e ${esc(data(p.fim))}.</p></div></div>`;
     else {
       html += `${p.obs ? `<div class="aviso">${esc(p.obs)}</div>` : ""}
       <div class="resumo-pncp">
         <div class="mini"><span>Contratos publicados</span><b class="num">${p.total.toLocaleString("pt-BR")}</b></div>
-        <div class="mini"><span>Valor somado${p.somados < p.total ? ` (dos ${p.somados.toLocaleString("pt-BR")} contratos lidos)` : ""}</span><b class="num">${brl(p.valor_total)}</b></div>
+        <div class="mini"><span>Valor somado${p.somados < p.total ? ` (${p.somados.toLocaleString("pt-BR")} maiores recentes)` : ""}</span><b class="num">${brl(p.valor_total)}</b></div>
         <div class="mini"><span>Período</span><b style="font-size:15px">${esc(data(p.inicio))} a ${esc(data(p.fim))}</b></div>
       </div>
       <div class="box"><h4>Maiores fornecedores (por valor)</h4><div class="scroll"><table>
@@ -1480,12 +1468,6 @@ function render(d, abaInicial) {
   document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () => abrir(t.dataset.tab)));
   document.querySelectorAll("[data-ir]").forEach(b => b.addEventListener("click", () => abrir(b.dataset.ir)));
   if (abaInicial && document.querySelector(`.tab[data-tab="${abaInicial}"]`)) abrir(abaInicial);
-  const novo = document.getElementById("pncp-de-novo");
-  if (novo) novo.addEventListener("click", () => {
-    d.pncp = {carregando: true};
-    render(d, "contratos");
-    carregarPncp(d, (d.orgao || {}).cnpj || "");
-  });
 }
 </script>
 </body>
@@ -1494,15 +1476,13 @@ function render(d, abaInicial) {
 
 
 def aquecer():
-    """Baixa as listas grandes com calma, depois que o site já abriu, e renova a cada 12 horas."""
-    time.sleep(60)  # deixa o site ligar e atender primeiro
+    """Baixa as listas grandes assim que o site liga e renova a cada 12 horas."""
     while True:
         for f in (lista_entes, lambda: capag_tabela("municipios"), lambda: capag_tabela("estados")):
             try:
                 f()
             except Exception:
                 pass
-            time.sleep(20)
         time.sleep(12 * 3600)
         with _lock:
             for k in ("entes", "capagmunicipios", "capagestados"):
@@ -1513,7 +1493,7 @@ def main():
     na_nuvem = "PORT" in os.environ or "--publico" in sys.argv
     srv = ThreadingHTTPServer(("0.0.0.0" if na_nuvem else "127.0.0.1", PORT), Handler)
     if os.environ.get("PORTAL_TRANSPARENCIA_CHAVE"):
-        threading.Timer(30, iniciar_lista_orgaos, args=(os.environ["PORTAL_TRANSPARENCIA_CHAVE"],)).start()
+        iniciar_lista_orgaos(os.environ["PORTAL_TRANSPARENCIA_CHAVE"])
     threading.Thread(target=aquecer, daemon=True).start()
     url = f"http://localhost:{PORT}"
     print(f"\n  Consulta Pagador Público rodando em {url}\n  (feche esta janela ou aperte Ctrl+C para parar)\n")
