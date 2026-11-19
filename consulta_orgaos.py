@@ -569,9 +569,9 @@ def federal(info, chave):
         return {"erro": f"Não encontrei '{nome}' na lista de órgãos do SIAFI."
                         + (f" Nomes parecidos: {parecidos}." if parecidos else "")}
     cod = str(alvo["codigo"])
-    hist = []
     ano_atual = date.today().year
-    for ano in range(ano_atual - 5, ano_atual + 1):
+
+    def um_ano(ano):
         linhas = []
         for param in ("orgao", "orgaoSuperior"):
             try:
@@ -584,9 +584,11 @@ def federal(info, chave):
         liq = sum(to_num(l.get("liquidado")) for l in linhas)
         pago = sum(to_num(l.get("pago")) for l in linhas)
         emp = sum(to_num(l.get("empenhado")) for l in linhas)
-        hist.append({"ano": ano, "empenhado": emp, "liquidado": liq, "pago": pago,
-                     "pct_pago": (pago / liq * 100) if liq else None, "parcial": ano == ano_atual})
-        time.sleep(0.4)  # respeita o limite de requisições do Portal
+        return {"ano": ano, "empenhado": emp, "liquidado": liq, "pago": pago,
+                "pct_pago": (pago / liq * 100) if liq else None, "parcial": ano == ano_atual}
+
+    with ThreadPoolExecutor(max_workers=3) as ex:  # poucos ao mesmo tempo, por causa do limite do Portal
+        hist = list(ex.map(lambda a: cached(f"fed{cod}{a}", 6 * 3600, lambda: um_ano(a)), range(ano_atual - 5, ano_atual + 1)))
     return {"orgao_siafi": {"codigo": cod, "descricao": alvo.get("descricao")},
             "outros": [{"codigo": c.get("codigo"), "descricao": c.get("descricao")} for c in candidatos[:6]],
             "historico": hist}
@@ -615,29 +617,27 @@ def pncp_pagina(cnpj, ini, fim, pagina, tamanho):
     return http_get(url, timeout=60)
 
 
-def pncp_contratos(cnpj, dias=365, max_paginas=10):
+def pncp_contratos(cnpj, dias=365, max_paginas=4):
     fim = date.today()
     ini = fim - timedelta(days=dias)
-    itens, total, tamanho, pagina = [], 0, 500, 1
-    while pagina <= max_paginas:
-        try:
-            d = pncp_pagina(cnpj, ini, fim, pagina, tamanho)
-        except urllib.error.HTTPError as e:
-            if e.code == 400 and tamanho == 500:
-                tamanho = 50
-                max_paginas = 40
-                continue
-            if e.code == 204:
-                break
+    tamanho = 500
+    try:
+        d = pncp_pagina(cnpj, ini, fim, 1, tamanho)
+    except urllib.error.HTTPError as e:
+        if e.code == 204:
+            d = None
+        elif e.code == 400:
+            tamanho, max_paginas = 50, 20
+            d = pncp_pagina(cnpj, ini, fim, 1, tamanho)
+        else:
             raise
-        if not d:
-            break
-        lst = d.get("data") or []
-        total = d.get("totalRegistros") or total or len(lst)
-        itens += lst
-        if not lst or (d.get("paginasRestantes") or 0) <= 0:
-            break
-        pagina += 1
+    itens = list((d or {}).get("data") or [])
+    total = (d or {}).get("totalRegistros") or len(itens)
+    paginas = min(max_paginas, (d or {}).get("totalPaginas") or 1)
+    if paginas > 1:
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            for r in ex.map(lambda pg: pncp_pagina(cnpj, ini, fim, pg, tamanho), range(2, paginas + 1)):
+                itens += (r or {}).get("data") or []
     contratos, fornecedores = [], {}
     valor_total = 0.0
     for c in itens:
@@ -782,9 +782,6 @@ def consultar(cnpj, chave=""):
                              "Esta ferramenta só analisa órgãos de governo.")
         return out
 
-    _pool = ThreadPoolExecutor(max_workers=1)
-    f_pncp = _pool.submit(pncp_contratos, c)
-
     base = info
     if esf == "publico":
         e2, b2 = esfera_pelo_efr(info.get("efr"))
@@ -854,18 +851,41 @@ def consultar(cnpj, chave=""):
                 out["ente"]["como"] = ("a nota usa os pagamentos do próprio órgão, na aba Pagamentos federais; "
                                        "a aba Histórico mostra a União como um todo")
 
-    try:
-        out["pncp"] = f_pncp.result()
-        ente_cnpj = digitos((ente or {}).get("cnpj")) if isinstance(ente, dict) else ""
-        if out["pncp"]["total"] == 0 and ente_cnpj and ente_cnpj != c and esf != "federal":
+    ente_cnpj = digitos((ente or {}).get("cnpj")) if isinstance(ente, dict) else ""
+    out["pncp_ente"] = ente_cnpj if ente_cnpj != c and esf != "federal" else ""
+    return out
+
+
+def pncp_do_orgao(cnpj, ente_cnpj=""):
+    def f():
+        r = pncp_contratos(cnpj)
+        if r["total"] == 0 and ente_cnpj and ente_cnpj != cnpj:
             r2 = pncp_contratos(ente_cnpj)
             if r2["total"]:
                 r2["obs"] = ("Este CNPJ não tem contratos próprios no PNCP. Mostramos os contratos publicados "
                              "pelo CNPJ principal do ente, que costuma contratar em nome das secretarias e fundos.")
-                out["pncp"] = r2
+                return r2
+        return r
+    try:
+        return cached(f"pncp{cnpj}{ente_cnpj}", 6 * 3600, f)
     except Exception as e:
-        out["pncp"] = {"erro": f"O PNCP não respondeu ({erro_txt(e)}). Tente de novo em alguns minutos."}
-    _pool.shutdown(wait=False)
+        return {"erro": f"O PNCP não respondeu ({erro_txt(e)}). Tente de novo em alguns minutos."}
+
+
+def consultar_rapido(cnpj, chave=""):
+    """Guarda o resultado por 6 horas; consultas repetidas aparecem na hora."""
+    c = digitos(cnpj)
+    chave_cache = f"consulta{c}{'k' if chave else ''}"
+    with _lock:
+        if chave_cache in _cache and time.time() - _cache[chave_cache][0] < 6 * 3600:
+            return _cache[chave_cache][1]
+    out = consultar(cnpj, chave)
+    falhou = (any(h.get("erro") for h in out.get("historico", []))
+              or (out.get("federal") or {}).get("erro")
+              or any("não respondeu" in a or "Não consegui" in a for a in out.get("avisos", [])))
+    if not falhou:
+        with _lock:
+            _cache[chave_cache] = (time.time(), out)
     return out
 
 
@@ -982,10 +1002,17 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 txt = "ERRO: " + erro_txt(e)
             return self._send(200, txt, "text/plain; charset=utf-8")
+        if u.path == "/api/pncp":
+            q = urllib.parse.parse_qs(u.query)
+            cn, en = digitos(q.get("cnpj", [""])[0]), digitos(q.get("ente", [""])[0])
+            if len(cn) != 14:
+                return self._send(400, json.dumps({"erro": "CNPJ inválido."}), "application/json; charset=utf-8")
+            res = pncp_do_orgao(cn, en if len(en) == 14 else "")
+            return self._send(200, json.dumps(res, ensure_ascii=False), "application/json; charset=utf-8")
         if u.path == "/api/consulta":
             q = urllib.parse.parse_qs(u.query)
             try:
-                res = consultar(q.get("cnpj", [""])[0], q.get("chave", [""])[0].strip())
+                res = consultar_rapido(q.get("cnpj", [""])[0], q.get("chave", [""])[0].strip())
                 return self._send(200, json.dumps(res, ensure_ascii=False), "application/json; charset=utf-8")
             except ValueError as e:
                 return self._send(400, json.dumps({"erro": str(e)}, ensure_ascii=False), "application/json; charset=utf-8")
@@ -1236,16 +1263,32 @@ $("#f").addEventListener("submit", async ev => {
   const chave = $("#chave").value.trim();
   try { chave ? localStorage.setItem("chave-portal", chave) : localStorage.removeItem("chave-portal"); } catch(e) {}
   $("#btn").disabled = true;
-  $("#out").innerHTML = `<div class="carregando"><div class="spin"></div>Consultando Receita, Tesouro Nacional e CAPAG. Se o site estava parado, a primeira consulta pode levar até 1 minuto.</div>`;
+  $("#out").innerHTML = `<div class="carregando"><div class="spin"></div>Consultando Receita Federal e Tesouro Nacional…</div>`;
   try {
     const r = await fetch(`/api/consulta?cnpj=${cnpj}&chave=${encodeURIComponent(chave)}`);
     const d = await r.json();
     if (!r.ok) throw new Error(d.erro || "Falha na consulta.");
+    if (d.esfera !== "privado") d.pncp = {carregando: true};
     render(d);
+    if (d.pncp) carregarPncp(d, cnpj);
   } catch (e) {
     $("#out").innerHTML = `<div class="erro"><b>Não deu para consultar.</b> ${esc(e.message)}</div>`;
   } finally { $("#btn").disabled = false; }
 });
+
+let consultaAtual = 0;
+async function carregarPncp(d, cnpj) {
+  const minha = ++consultaAtual;
+  try {
+    const r = await fetch(`/api/pncp?cnpj=${cnpj}&ente=${d.pncp_ente || ""}`);
+    d.pncp = await r.json();
+  } catch (e) {
+    d.pncp = {erro: "O PNCP não respondeu. Tente de novo em alguns minutos."};
+  }
+  if (minha !== consultaAtual) return;  // o usuário já fez outra consulta
+  const aba = (document.querySelector('.tab[aria-selected="true"]') || {}).dataset?.tab;
+  render(d, aba);
+}
 
 function gauge(score, nivel) {
   const r = 44, c = 2 * Math.PI * r, v = score == null ? 0 : score;
@@ -1279,11 +1322,12 @@ function grafico(hist) {
 
 function statPncp(p) {
   if (!p) return "";
+  if (p.carregando) return `<div class="stat"><div class="lb">${ICON.contrato} Contratos no PNCP</div><div class="v c-acc" style="display:flex;align-items:center;gap:8px"><span class="spin" style="width:16px;height:16px"></span></div><div class="s">buscando no PNCP…</div></div>`;
   if (p.erro) return `<div class="stat"><div class="lb">${ICON.contrato} Contratos no PNCP</div><div class="v c-acc">—</div><div class="s">PNCP indisponível</div></div>`;
   return `<div class="stat"><div class="lb">${ICON.contrato} Contratos no PNCP</div><div class="v c-acc num">${(p.total || 0).toLocaleString("pt-BR")}</div><div class="s">${brl(p.valor_total)} · 12 meses</div></div>`;
 }
 
-function render(d) {
+function render(d, abaInicial) {
   const o = d.orgao || {}, a = d.avaliacao, h = d.historico || [], cap = d.capag;
   const nv = a ? a.nivel : "sem_dados";
   const ativa = /ativa/i.test(o.situacao || "");
@@ -1362,7 +1406,8 @@ function render(d) {
   if (d.pncp) {
     const p = d.pncp;
     html += `<div class="painel" data-p="contratos" hidden>`;
-    if (p.erro) html += `<div class="aviso">${esc(p.erro)}</div>`;
+    if (p.carregando) html += `<div class="carregando"><div class="spin"></div>Buscando os contratos no PNCP. Aparecem aqui em alguns segundos.</div>`;
+    else if (p.erro) html += `<div class="aviso">${esc(p.erro)}</div>`;
     else if (!p.total) html += `<div class="faixa t-neutro">${ICON.alerta}<div><b>Nenhum contrato no PNCP</b><p>Este órgão não publicou contratos no Portal Nacional de Contratações Públicas entre ${esc(data(p.inicio))} e ${esc(data(p.fim))}.</p></div></div>`;
     else {
       html += `${p.obs ? `<div class="aviso">${esc(p.obs)}</div>` : ""}
@@ -1422,6 +1467,7 @@ function render(d) {
   };
   document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () => abrir(t.dataset.tab)));
   document.querySelectorAll("[data-ir]").forEach(b => b.addEventListener("click", () => abrir(b.dataset.ir)));
+  if (abaInicial && document.querySelector(`.tab[data-tab="${abaInicial}"]`)) abrir(abaInicial);
 }
 </script>
 </body>
@@ -1429,11 +1475,26 @@ function render(d) {
 """
 
 
+def aquecer():
+    """Baixa as listas grandes assim que o site liga e renova a cada 12 horas."""
+    while True:
+        for f in (lista_entes, lambda: capag_tabela("municipios"), lambda: capag_tabela("estados")):
+            try:
+                f()
+            except Exception:
+                pass
+        time.sleep(12 * 3600)
+        with _lock:
+            for k in ("entes", "capagmunicipios", "capagestados"):
+                _cache.pop(k, None)
+
+
 def main():
     na_nuvem = "PORT" in os.environ or "--publico" in sys.argv
     srv = ThreadingHTTPServer(("0.0.0.0" if na_nuvem else "127.0.0.1", PORT), Handler)
     if os.environ.get("PORTAL_TRANSPARENCIA_CHAVE"):
         iniciar_lista_orgaos(os.environ["PORTAL_TRANSPARENCIA_CHAVE"])
+    threading.Thread(target=aquecer, daemon=True).start()
     url = f"http://localhost:{PORT}"
     print(f"\n  Consulta Pagador Público rodando em {url}\n  (feche esta janela ou aperte Ctrl+C para parar)\n")
     if not na_nuvem and "--sem-navegador" not in sys.argv:
