@@ -1219,10 +1219,20 @@ try { const k = localStorage.getItem("chave-portal"); if (k) $("#chave").value =
 $("#cnpj").addEventListener("input", e => e.target.value = mascara(e.target.value));
 document.querySelectorAll(".chip-ex").forEach(b => b.addEventListener("click", () => { $("#cnpj").value = mascara(b.dataset.cnpj); $("#f").requestSubmit(); }));
 
+// Abrir já consultando: ?cnpj=00000000000000 (com ou sem pontuação)
+setTimeout(() => {
+  let c = "";
+  try { c = new URLSearchParams(location.search).get("cnpj") || ""; } catch (e) {}
+  if (!c) { const m = /cnpj=([\d./-]+)/.exec(location.hash); if (m) c = m[1]; }
+  c = c.replace(/\D/g, "");
+  if (c.length === 14) { $("#cnpj").value = mascara(c); $("#f").requestSubmit(); }
+}, 0);
+
 $("#f").addEventListener("submit", async ev => {
   ev.preventDefault();
   const cnpj = $("#cnpj").value.replace(/\D/g,"");
   if (cnpj.length !== 14) { $("#out").innerHTML = `<div class="erro">O CNPJ precisa ter 14 números.</div>`; return; }
+  try { history.replaceState(null, "", "?cnpj=" + cnpj); } catch (e) {}
   const chave = $("#chave").value.trim();
   try { chave ? localStorage.setItem("chave-portal", chave) : localStorage.removeItem("chave-portal"); } catch(e) {}
   $("#btn").disabled = true;
