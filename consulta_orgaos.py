@@ -333,6 +333,89 @@ def dca_ano(id_ente, ano):
     return item
 
 
+def _rreo_fornecedores(items):
+    """Soma liquidado e pago ATÉ o bimestre das despesas com fornecedores
+    (Outras Despesas Correntes + Investimentos), sem salários e juros."""
+    contas = {}
+    for it in items:
+        conta, col = norm(it.get("conta")), norm(it.get("coluna"))
+        if not (conta.startswith("outras despesas correntes") or conta.startswith("investimentos")):
+            continue
+        if "intra" in conta:
+            continue
+        if "ate o bimestre" not in col and "ate o periodo" not in col:
+            continue
+        chave = "odc" if conta.startswith("outras") else "inv"
+        c = contas.setdefault(chave, {"liq": 0.0, "pago": 0.0})
+        v = to_num(it.get("valor"))
+        if "liquidad" in col and "inscrit" not in col:
+            c["liq"] = max(c["liq"], v)
+        elif "paga" in col and "inscrit" not in col:
+            c["pago"] = max(c["pago"], v)
+    liq = sum(c["liq"] for c in contas.values())
+    pago = sum(c["pago"] for c in contas.values())
+    return liq, pago
+
+
+def prazo_ente(id_ente):
+    """Prazo médio estimado de pagamento a fornecedores, pelo último RREO entregue."""
+    hoje = date.today()
+    tentativas = [(hoje.year, n) for n in range(6, 0, -1)] + [(hoje.year - 1, 6)]
+    for ano, per in tentativas:
+        if ano == hoje.year and per * 2 > hoje.month + 1:
+            continue  # bimestre ainda não terminou
+        try:
+            its = cached(f"rreo1{id_ente}{ano}{per}", 21600, lambda: siconfi("rreo", {
+                "an_exercicio": ano, "nr_periodo": per, "co_tipo_demonstrativo": "RREO",
+                "no_anexo": "RREO-Anexo 01", "id_ente": id_ente}))
+        except Exception:
+            continue
+        if not its:
+            continue
+        liq, pago = _rreo_fornecedores(its)
+        if liq <= 0 or pago <= 0:
+            continue
+        dias = round(per * 365 / 6)
+        return {"dias": max(0, round((liq - pago) / (pago / dias))), "liquidado": liq, "pago": pago,
+                "fila": max(liq - pago, 0), "ano": ano, "periodo": f"{per}º bimestre de {ano}",
+                "fonte": "RREO (relatório bimestral do Tesouro), só despesas com fornecedores"}
+    return None
+
+
+def prazo_federal(fed):
+    """Mesmo cálculo para órgão federal, com os números do Portal da Transparência (inclui salários)."""
+    hist = {h["ano"]: h for h in fed.get("historico", [])}
+    hoje = date.today()
+    for ano, dias in ((hoje.year, hoje.timetuple().tm_yday), (hoje.year - 1, 365)):
+        h = hist.get(ano)
+        if h and h.get("liquidado") and h.get("pago"):
+            liq, pago = h["liquidado"], h["pago"]
+            return {"dias": max(0, round((liq - pago) / (pago / dias))), "liquidado": liq, "pago": pago,
+                    "fila": max(liq - pago, 0), "ano": ano,
+                    "periodo": f"{ano} até agora" if ano == hoje.year else str(ano),
+                    "fonte": "Portal da Transparência (inclui salários, que são pagos em dia)"}
+    return None
+
+
+def aplicar_prazo(av, pz):
+    """Coloca o prazo na avaliação: etiqueta, motivo e um pequeno ajuste na nota."""
+    if not av or not pz or av.get("score") is None:
+        return
+    d = pz["dias"]
+    av["prazo"] = pz
+    av["motivos"].append(f"Prazo médio estimado de pagamento: cerca de {d} dias ({pz['periodo']}).")
+    if d > 60:
+        av["alertas"] = (av.get("alertas") or []) + [{"texto": "Atrasa muito", "tipo": "ruim"}]
+        av["score"] = max(0, av["score"] - 10)
+    elif d > 30:
+        av["alertas"] = (av.get("alertas") or []) + [{"texto": "Costuma atrasar", "tipo": "atencao"}]
+        av["score"] = max(0, av["score"] - 5)
+    else:
+        av["alertas"] = (av.get("alertas") or []) + [{"texto": "Paga em até 30 dias", "tipo": "bom"}]
+    av["nivel"] = nivel_do_score(av["score"])
+    av["titulo"] = TITULOS[av["nivel"]]
+
+
 def entregas(id_ente, ano):
     try:
         its = siconfi("extrato_entregas", {"id_ente": id_ente, "an_referencia": ano})
@@ -611,29 +694,44 @@ def link_pncp(numero):
     return f"https://pncp.gov.br/app/contratos/{m.group(1)}/{m.group(3)}/{int(m.group(2))}"
 
 
-def pncp_pagina(cnpj, ini, fim, pagina, tamanho, timeout=40):
+def pncp_pagina(cnpj, ini, fim, pagina, tamanho, timeout=40, tentativas=2):
     url = (f"{PNCP}/contratos?dataInicial={ini:%Y%m%d}&dataFinal={fim:%Y%m%d}"
            f"&cnpjOrgao={cnpj}&pagina={pagina}&tamanhoPagina={tamanho}")
-    for tentativa in (1, 2):  # o PNCP às vezes demora: tenta de novo uma vez
+    for tentativa in range(1, tentativas + 1):  # o PNCP às vezes demora: tenta de novo
         try:
             return http_get(url, timeout=timeout)
         except urllib.error.HTTPError as e:
             if e.code == 204:
                 return None
-            if tentativa == 2 or e.code < 500:
+            if tentativa == tentativas or e.code < 500:
                 raise
         except Exception:
-            if tentativa == 2:
+            if tentativa == tentativas:
                 raise
         time.sleep(2)
 
 
-def pncp_contratos(cnpj, dias=365):
+def pncp_contratos(cnpj, dias=None):
+    """Tenta 12 meses; se o PNCP demorar (órgãos gigantes), tenta 90 e depois 30 dias."""
+    if dias:
+        return _pncp_contratos(cnpj, dias)
+    ultimo = None
+    for d, espera in ((365, 25), (90, 25), (30, 30)):
+        try:
+            r = _pncp_contratos(cnpj, d, espera)
+            r["dias"] = d
+            return r
+        except Exception as e:
+            ultimo = e
+    raise ultimo
+
+
+def _pncp_contratos(cnpj, dias=365, espera=40):
     """1º pede 50 contratos (rápido, já traz o total). Órgão até 2.000 contratos: lê todos.
     Órgão muito grande: lê uma amostra de até 500 contratos para somar valores e fornecedores."""
     fim = date.today()
     ini = fim - timedelta(days=dias)
-    d = pncp_pagina(cnpj, ini, fim, 1, 50)
+    d = pncp_pagina(cnpj, ini, fim, 1, 50, timeout=espera, tentativas=1)
     itens = list((d or {}).get("data") or [])
     total = (d or {}).get("totalRegistros") or len(itens)
     if total > len(itens):
@@ -843,6 +941,7 @@ def consultar(cnpj, chave=""):
             f_hist = [ex.submit(dca_ano, idt, a) for a in anos]
             f_ent = [ex.submit(entregas, idt, a) for a in (ano, ano - 1)] if esf != "federal" else []
             f_cap = ex.submit(capag_do_ente, ente) if esf != "federal" else None
+            f_prz = ex.submit(prazo_ente, idt) if esf != "federal" else None
             out["historico"] = [f.result() for f in f_hist]
             out["entregas"] = [f.result() for f in f_ent]
             if f_cap:
@@ -851,6 +950,11 @@ def consultar(cnpj, chave=""):
                 except Exception as e:
                     out["capag"] = {"nota": "", "obs": f"Não consegui baixar a planilha CAPAG ({erro_txt(e)})."}
         out["avaliacao"] = avaliar_rp(out["historico"], out.get("capag"), out.get("entregas"))
+        if f_prz:
+            try:
+                aplicar_prazo(out["avaliacao"], f_prz.result())
+            except Exception:
+                pass
         falhas = [h for h in out["historico"] if h.get("erro")]
         if len(falhas) == len(anos):
             out["avisos"].append(f"O SICONFI não respondeu ({falhas[0]['erro']}). Tente de novo em alguns minutos.")
@@ -860,6 +964,7 @@ def consultar(cnpj, chave=""):
     if out.get("federal") and not out["federal"].get("erro"):
         av = avaliar_federal(out["federal"])
         if av:
+            aplicar_prazo(av, prazo_federal(out["federal"]))
             out["avaliacao"] = av
             if out.get("ente"):
                 out["ente"]["nome"] = out["federal"]["orgao_siafi"]["descricao"]
@@ -1007,23 +1112,42 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 txt = "ERRO: " + erro_txt(e)
             return self._send(200, txt, "text/plain; charset=utf-8")
+        if u.path == "/diagnostico-prazo":
+            q = urllib.parse.parse_qs(u.query)
+            ibge = digitos(q.get("ibge", ["3550308"])[0])
+            linhas = [f"DIAGNOSTICO PRAZO ente={ibge}"]
+            try:
+                pz = prazo_ente(ibge)
+                linhas.append("resultado: " + json.dumps(pz, ensure_ascii=False))
+                hoje = date.today()
+                for ano, per in [(hoje.year, n) for n in range(6, 0, -1)] + [(hoje.year - 1, 6)]:
+                    if ano == hoje.year and per * 2 > hoje.month + 1:
+                        continue
+                    its = siconfi("rreo", {"an_exercicio": ano, "nr_periodo": per, "co_tipo_demonstrativo": "RREO",
+                                           "no_anexo": "RREO-Anexo 01", "id_ente": ibge})
+                    linhas.append(f"== RREO {ano} bimestre {per}: {len(its)} itens")
+                    if its:
+                        for it in its:
+                            cn = norm(it.get("conta"))
+                            if cn.startswith(("outras despesas correntes", "investimentos", "despesas correntes", "total")):
+                                linhas.append(f"   {it.get('conta')} | {it.get('coluna')} | {it.get('valor')}")
+                        break
+            except Exception as e:
+                linhas.append("ERRO: " + erro_txt(e))
+            return self._send(200, "\n".join(linhas[:200]), "text/plain; charset=utf-8")
         if u.path == "/diagnostico-pncp":
             q = urllib.parse.parse_qs(u.query)
             cn = digitos(q.get("cnpj", ["46395000000139"])[0])
             fim = date.today()
-            try:
-                d = pncp_pagina(cn, fim - timedelta(days=365), fim, 1, 10)
-                txt = json.dumps(d, ensure_ascii=False, indent=1)[:12000] if d else "resposta vazia (sem contratos)"
-            except Exception as e:
-                txt = "ERRO: " + erro_txt(e)
-            return self._send(200, txt, "text/plain; charset=utf-8")
-        if u.path == "/api/pncp":
-            q = urllib.parse.parse_qs(u.query)
-            cn, en = digitos(q.get("cnpj", [""])[0]), digitos(q.get("ente", [""])[0])
-            if len(cn) != 14:
-                return self._send(400, json.dumps({"erro": "CNPJ inválido."}), "application/json; charset=utf-8")
-            res = pncp_do_orgao(cn, en if len(en) == 14 else "")
-            return self._send(200, json.dumps(res, ensure_ascii=False), "application/json; charset=utf-8")
+            linhas = [f"DIAGNOSTICO PNCP {cn}"]
+            for dias in (365, 90, 30):
+                t0 = time.time()
+                try:
+                    d = pncp_pagina(cn, fim - timedelta(days=dias), fim, 1, 10, timeout=60, tentativas=1)
+                    linhas.append(f"{dias} dias: {time.time() - t0:.1f}s total={(d or {}).get('totalRegistros')} paginas={(d or {}).get('totalPaginas')}")
+                except Exception as e:
+                    linhas.append(f"{dias} dias: ERRO depois de {time.time() - t0:.1f}s: {erro_txt(e)}")
+            return self._send(200, "\n".join(linhas), "text/plain; charset=utf-8")
         if u.path == "/api/consulta":
             q = urllib.parse.parse_qs(u.query)
             try:
@@ -1105,7 +1229,7 @@ details.chv .campo{margin-top:10px}
 .badge{display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:600;padding:5px 12px;border-radius:999px;background:var(--accent-soft);color:var(--accent);white-space:nowrap}
 .badge.ok{background:var(--good-bg);color:var(--good)} .badge.no{background:var(--bad-bg);color:var(--bad)}
 hr.sep{border:0;border-top:1px solid var(--line);margin:0}
-.stats{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:18px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:18px}
 .stat .lb{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:13px}
 .stat .v{font-size:22px;font-weight:800;margin-top:4px;line-height:1.2}
 .stat .s{color:var(--muted);font-size:12.5px;margin-top:2px}
@@ -1335,11 +1459,12 @@ function grafico(hist) {
   return s + `</svg><div class="legend"><span><i style="background:var(--good)"></i>Pago</span><span><i style="background:var(--dim)"></i>Cancelado sem pagar</span><span>Linhas tracejadas: 85% (bom) e 65% (mínimo regular)</span></div>`;
 }
 
+function periodoPncp(p) { return !p.dias || p.dias >= 365 ? "12 meses" : "últimos " + p.dias + " dias"; }
 function statPncp(p) {
   if (!p) return "";
   if (p.carregando) return `<div class="stat"><div class="lb">${ICON.contrato} Contratos no PNCP</div><div class="v c-acc" style="display:flex;align-items:center;gap:8px"><span class="spin" style="width:16px;height:16px"></span></div><div class="s">buscando no PNCP…</div></div>`;
   if (p.erro) return `<div class="stat"><div class="lb">${ICON.contrato} Contratos no PNCP</div><div class="v c-acc">—</div><div class="s">PNCP indisponível</div></div>`;
-  return `<div class="stat"><div class="lb">${ICON.contrato} Contratos no PNCP</div><div class="v c-acc num">${(p.total || 0).toLocaleString("pt-BR")}</div><div class="s">${p.somados < p.total ? "últimos 12 meses" : brl(p.valor_total) + " · 12 meses"}</div></div>`;
+  return `<div class="stat"><div class="lb">${ICON.contrato} Contratos no PNCP</div><div class="v c-acc num">${(p.total || 0).toLocaleString("pt-BR")}</div><div class="s">${p.somados < p.total ? periodoPncp(p) : brl(p.valor_total) + " · " + periodoPncp(p)}</div></div>`;
 }
 
 function render(d, abaInicial) {
@@ -1361,6 +1486,7 @@ function render(d, abaInicial) {
       <div class="stat"><div class="lb">${ICON.barras} Nota do órgão</div><div class="v c-${nv} num">${a.score == null ? "—" : a.score + " · " + esc(a.titulo.split(" ")[0])}</div><div class="s">de 0 a 100</div></div>
       <div class="stat"><div class="lb">${ICON.doc} Nota CAPAG</div><div class="v c-acc">${esc((cap && cap.nota) || "—")}</div><div class="s">Tesouro Nacional</div></div>
       <div class="stat"><div class="lb">${ICON.moeda} Contas pagas</div><div class="v c-acc num">${pct(a.pct_pago)}</div><div class="s">${esc(a.periodo || "")}</div></div>
+      ${a.prazo ? `<div class="stat"><div class="lb">${ICON.barras} Prazo de pagamento</div><div class="v num c-${a.prazo.dias > 60 ? "ruim" : a.prazo.dias > 30 ? "regular" : "bom"}">~${a.prazo.dias} dias</div><div class="s">média estimada</div></div>` : ""}
       ${statPncp(d.pncp)}
     </div><hr class="sep">`;
   } else if (d.pncp && !d.pncp.erro) {
@@ -1440,7 +1566,7 @@ function render(d, abaInicial) {
         ${p.contratos.map(k => `<tr><td>${esc(data(k.assinatura))}</td><td class="forn">${esc(k.fornecedor)}</td><td class="obj">${esc(k.objeto)}</td><td>${brl(k.valor)}</td><td>${esc(data(k.fim))}</td>
           <td>${k.link ? `<a href="${esc(k.link)}" target="_blank" rel="noopener">Ver no PNCP</a>` : ""}</td></tr>`).join("")}
       </table></div></div>
-      <p class="hint" style="margin:0">Fonte: PNCP, Portal Nacional de Contratações Públicas. Mostra os contratos publicados nos últimos 12 meses.</p>`;
+      <p class="hint" style="margin:0">Fonte: PNCP, Portal Nacional de Contratações Públicas. Mostra os contratos publicados ${p.dias && p.dias < 365 ? "nos últimos " + p.dias + " dias (o PNCP demorou demais para responder sobre 12 meses deste órgão)" : "nos últimos 12 meses"}.</p>`;
     }
     html += `</div>`;
   }
