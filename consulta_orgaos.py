@@ -611,33 +611,48 @@ def link_pncp(numero):
     return f"https://pncp.gov.br/app/contratos/{m.group(1)}/{m.group(3)}/{int(m.group(2))}"
 
 
-def pncp_pagina(cnpj, ini, fim, pagina, tamanho):
+def pncp_pagina(cnpj, ini, fim, pagina, tamanho, timeout=40):
     url = (f"{PNCP}/contratos?dataInicial={ini:%Y%m%d}&dataFinal={fim:%Y%m%d}"
            f"&cnpjOrgao={cnpj}&pagina={pagina}&tamanhoPagina={tamanho}")
-    return http_get(url, timeout=60)
+    for tentativa in (1, 2):  # o PNCP às vezes demora: tenta de novo uma vez
+        try:
+            return http_get(url, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            if e.code == 204:
+                return None
+            if tentativa == 2 or e.code < 500:
+                raise
+        except Exception:
+            if tentativa == 2:
+                raise
+        time.sleep(2)
 
 
-def pncp_contratos(cnpj, dias=365, max_paginas=4):
+def pncp_contratos(cnpj, dias=365):
+    """1º pede 50 contratos (rápido, já traz o total). Órgão até 2.000 contratos: lê todos.
+    Órgão muito grande: lê uma amostra de até 500 contratos para somar valores e fornecedores."""
     fim = date.today()
     ini = fim - timedelta(days=dias)
-    tamanho = 500
-    try:
-        d = pncp_pagina(cnpj, ini, fim, 1, tamanho)
-    except urllib.error.HTTPError as e:
-        if e.code == 204:
-            d = None
-        elif e.code == 400:
-            tamanho, max_paginas = 50, 20
-            d = pncp_pagina(cnpj, ini, fim, 1, tamanho)
-        else:
-            raise
+    d = pncp_pagina(cnpj, ini, fim, 1, 50)
     itens = list((d or {}).get("data") or [])
     total = (d or {}).get("totalRegistros") or len(itens)
-    paginas = min(max_paginas, (d or {}).get("totalPaginas") or 1)
-    if paginas > 1:
+    if total > len(itens):
+        if total <= 2000:
+            tam, paginas = 500, range(1, (total + 499) // 500 + 1)
+        else:
+            tam, paginas = 50, range(2, 11)  # amostra: mais 9 páginas de 50
+        extras = []
         with ThreadPoolExecutor(max_workers=4) as ex:
-            for r in ex.map(lambda pg: pncp_pagina(cnpj, ini, fim, pg, tamanho), range(2, paginas + 1)):
-                itens += (r or {}).get("data") or []
+            futuros = [ex.submit(pncp_pagina, cnpj, ini, fim, pg, tam) for pg in paginas]
+            for f in futuros:
+                try:
+                    extras += (f.result() or {}).get("data") or []
+                except Exception:
+                    pass  # se uma página falhar, fica com o que conseguiu
+        if tam == 500 and extras:
+            itens = extras
+        else:
+            itens += extras
     contratos, fornecedores = [], {}
     valor_total = 0.0
     for c in itens:
@@ -1324,7 +1339,7 @@ function statPncp(p) {
   if (!p) return "";
   if (p.carregando) return `<div class="stat"><div class="lb">${ICON.contrato} Contratos no PNCP</div><div class="v c-acc" style="display:flex;align-items:center;gap:8px"><span class="spin" style="width:16px;height:16px"></span></div><div class="s">buscando no PNCP…</div></div>`;
   if (p.erro) return `<div class="stat"><div class="lb">${ICON.contrato} Contratos no PNCP</div><div class="v c-acc">—</div><div class="s">PNCP indisponível</div></div>`;
-  return `<div class="stat"><div class="lb">${ICON.contrato} Contratos no PNCP</div><div class="v c-acc num">${(p.total || 0).toLocaleString("pt-BR")}</div><div class="s">${brl(p.valor_total)} · 12 meses</div></div>`;
+  return `<div class="stat"><div class="lb">${ICON.contrato} Contratos no PNCP</div><div class="v c-acc num">${(p.total || 0).toLocaleString("pt-BR")}</div><div class="s">${p.somados < p.total ? "últimos 12 meses" : brl(p.valor_total) + " · 12 meses"}</div></div>`;
 }
 
 function render(d, abaInicial) {
@@ -1413,7 +1428,7 @@ function render(d, abaInicial) {
       html += `${p.obs ? `<div class="aviso">${esc(p.obs)}</div>` : ""}
       <div class="resumo-pncp">
         <div class="mini"><span>Contratos publicados</span><b class="num">${p.total.toLocaleString("pt-BR")}</b></div>
-        <div class="mini"><span>Valor somado${p.somados < p.total ? ` (${p.somados.toLocaleString("pt-BR")} maiores recentes)` : ""}</span><b class="num">${brl(p.valor_total)}</b></div>
+        <div class="mini"><span>Valor somado${p.somados < p.total ? ` (amostra de ${p.somados.toLocaleString("pt-BR")} contratos)` : ""}</span><b class="num">${brl(p.valor_total)}</b></div>
         <div class="mini"><span>Período</span><b style="font-size:15px">${esc(data(p.inicio))} a ${esc(data(p.fim))}</b></div>
       </div>
       <div class="box"><h4>Maiores fornecedores (por valor)</h4><div class="scroll"><table>
