@@ -351,35 +351,44 @@ def entregas(id_ente, ano):
 
 
 # ----------------------------------------------------------------- CAPAG
-def ler_xlsx(raw):
+def ler_xlsx(raw, max_colunas=40):
+    """Lê a primeira planilha aos poucos (iterparse), sem montar o arquivo inteiro na memória."""
     z = zipfile.ZipFile(io.BytesIO(raw))
     m = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
     ss = []
     if "xl/sharedStrings.xml" in z.namelist():
-        root = ET.fromstring(z.read("xl/sharedStrings.xml"))
-        for si in root.findall(m + "si"):
-            ss.append("".join(t.text or "" for t in si.iter(m + "t")))
+        with z.open("xl/sharedStrings.xml") as f:
+            for _, el in ET.iterparse(f):
+                if el.tag == m + "si":
+                    ss.append("".join(t.text or "" for t in el.iter(m + "t")))
+                    el.clear()
     folhas = sorted((n for n in z.namelist() if re.match(r"xl/worksheets/sheet\d+\.xml$", n)),
                     key=lambda n: int(re.search(r"(\d+)\.xml$", n).group(1)))
-    root = ET.fromstring(z.read(folhas[0]))
     rows = []
-    for row in root.iter(m + "row"):
-        vals = {}
-        for c in row.findall(m + "c"):
-            ref = re.match(r"[A-Z]+", c.get("r", "A"))
-            idx = 0
-            for ch in ref.group(0):
-                idx = idx * 26 + ord(ch) - 64
-            t, v = c.get("t"), c.find(m + "v")
-            if t == "s" and v is not None:
-                val = ss[int(v.text)]
-            elif t == "inlineStr":
-                val = "".join(x.text or "" for x in c.iter(m + "t"))
-            else:
-                val = v.text if v is not None else ""
-            vals[idx - 1] = val
-        if vals:
-            rows.append([vals.get(i, "") for i in range(max(vals) + 1)])
+    with z.open(folhas[0]) as f:
+        for _, row in ET.iterparse(f):
+            if row.tag != m + "row":
+                continue
+            vals = {}
+            for c in row.findall(m + "c"):
+                ref = re.match(r"[A-Z]+", c.get("r", "A"))
+                idx = 0
+                for ch in ref.group(0):
+                    idx = idx * 26 + ord(ch) - 64
+                if idx > max_colunas:
+                    continue
+                t, v = c.get("t"), c.find(m + "v")
+                if t == "s" and v is not None:
+                    val = ss[int(v.text)]
+                elif t == "inlineStr":
+                    val = "".join(x.text or "" for x in c.iter(m + "t"))
+                else:
+                    val = v.text if v is not None else ""
+                vals[idx - 1] = val
+            row.clear()
+            if vals:
+                rows.append([vals.get(i, "") for i in range(max(vals) + 1)])
+    del ss
     return rows
 
 
@@ -1485,13 +1494,15 @@ function render(d, abaInicial) {
 
 
 def aquecer():
-    """Baixa as listas grandes assim que o site liga e renova a cada 12 horas."""
+    """Baixa as listas grandes com calma, depois que o site já abriu, e renova a cada 12 horas."""
+    time.sleep(60)  # deixa o site ligar e atender primeiro
     while True:
         for f in (lista_entes, lambda: capag_tabela("municipios"), lambda: capag_tabela("estados")):
             try:
                 f()
             except Exception:
                 pass
+            time.sleep(20)
         time.sleep(12 * 3600)
         with _lock:
             for k in ("entes", "capagmunicipios", "capagestados"):
@@ -1502,7 +1513,7 @@ def main():
     na_nuvem = "PORT" in os.environ or "--publico" in sys.argv
     srv = ThreadingHTTPServer(("0.0.0.0" if na_nuvem else "127.0.0.1", PORT), Handler)
     if os.environ.get("PORTAL_TRANSPARENCIA_CHAVE"):
-        iniciar_lista_orgaos(os.environ["PORTAL_TRANSPARENCIA_CHAVE"])
+        threading.Timer(30, iniciar_lista_orgaos, args=(os.environ["PORTAL_TRANSPARENCIA_CHAVE"],)).start()
     threading.Thread(target=aquecer, daemon=True).start()
     url = f"http://localhost:{PORT}"
     print(f"\n  Consulta Pagador Público rodando em {url}\n  (feche esta janela ou aperte Ctrl+C para parar)\n")
