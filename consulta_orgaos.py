@@ -382,19 +382,14 @@ def prazo_ente(id_ente):
     return None
 
 
-def prazo_federal(fed):
-    """Mesmo cálculo para órgão federal, com os números do Portal da Transparência (inclui salários)."""
-    hist = {h["ano"]: h for h in fed.get("historico", [])}
-    hoje = date.today()
-    for ano, dias in ((hoje.year, hoje.timetuple().tm_yday), (hoje.year - 1, 365)):
-        h = hist.get(ano)
-        if h and h.get("liquidado") and h.get("pago"):
-            liq, pago = h["liquidado"], h["pago"]
-            return {"dias": max(0, round((liq - pago) / (pago / dias))), "liquidado": liq, "pago": pago,
-                    "fila": max(liq - pago, 0), "ano": ano,
-                    "periodo": f"{ano} até agora" if ano == hoje.year else str(ano),
-                    "fonte": "Portal da Transparência (inclui salários, que são pagos em dia)"}
-    return None
+def prazo_federal(fed=None):
+    """Órgão federal: o Portal só tem o total com salários, que esconde a demora com fornecedores.
+    Por isso usa o RREO da União (só fornecedores): é a média do Governo Federal."""
+    pz = prazo_ente(1)
+    if pz:
+        pz["fonte"] = "RREO da União, só despesas com fornecedores (média do Governo Federal, não do órgão)"
+        pz["periodo"] = pz["periodo"] + ", média do Governo Federal"
+    return pz
 
 
 def aplicar_prazo(av, pz):
@@ -1486,7 +1481,7 @@ function render(d, abaInicial) {
       <div class="stat"><div class="lb">${ICON.barras} Nota do órgão</div><div class="v c-${nv} num">${a.score == null ? "—" : a.score + " · " + esc(a.titulo.split(" ")[0])}</div><div class="s">de 0 a 100</div></div>
       <div class="stat"><div class="lb">${ICON.doc} Nota CAPAG</div><div class="v c-acc">${esc((cap && cap.nota) || "—")}</div><div class="s">Tesouro Nacional</div></div>
       <div class="stat"><div class="lb">${ICON.moeda} Contas pagas</div><div class="v c-acc num">${pct(a.pct_pago)}</div><div class="s">${esc(a.periodo || "")}</div></div>
-      ${a.prazo ? `<div class="stat"><div class="lb">${ICON.barras} Prazo de pagamento</div><div class="v num c-${a.prazo.dias > 60 ? "ruim" : a.prazo.dias > 30 ? "regular" : "bom"}">~${a.prazo.dias} dias</div><div class="s">média estimada</div></div>` : ""}
+      ${a.prazo ? `<div class="stat"><div class="lb">${ICON.barras} Prazo de pagamento</div><div class="v num c-${a.prazo.dias > 60 ? "ruim" : a.prazo.dias > 30 ? "regular" : "bom"}">~${a.prazo.dias} dia${a.prazo.dias === 1 ? "" : "s"}</div><div class="s">${/Governo Federal/.test(a.prazo.periodo) ? "média do Governo Federal" : "média estimada"}</div></div>` : ""}
       ${statPncp(d.pncp)}
     </div><hr class="sep">`;
   } else if (d.pncp && !d.pncp.erro) {
