@@ -482,48 +482,85 @@ def parecido(a, b):
     return (sum(casa(x, B) for x in A) / len(A) + sum(casa(y, A) for y in B) / len(B)) / 2
 
 
-def portal_orgaos(termo, H):
-    r = http_get(f"{PORTAL}/orgaos-siafi?" + urllib.parse.urlencode({"descricao": termo, "pagina": 1}), H)
-    return [c for c in (r or []) if c.get("codigo")]
+_orgaos = {"lista": None, "carregando": False, "paginas": 0, "erro": ""}
+_orgaos_lock = threading.Lock()
 
 
-def achar_orgao_siafi(info, H):
+def _baixar_orgaos(chave):
+    H = {"chave-api-dados": chave}
+    todos, pagina = [], 1
+    try:
+        while pagina <= 600:
+            r = None
+            for tentativa in range(4):
+                try:
+                    r = http_get(f"{PORTAL}/orgaos-siafi?pagina={pagina}", H)
+                    break
+                except urllib.error.HTTPError as e:
+                    if e.code in (401, 403):
+                        raise
+                    time.sleep(5 * (tentativa + 1))  # limite de requisições: espera e tenta de novo
+            if not r:
+                break
+            todos += [c for c in r if c.get("codigo") and "codigo invalido" not in norm(c.get("descricao"))]
+            _orgaos["paginas"] = pagina
+            pagina += 1
+            time.sleep(0.75)
+        _orgaos["lista"] = todos
+        _orgaos["erro"] = ""
+    except Exception as e:
+        _orgaos["erro"] = erro_txt(e)
+    finally:
+        _orgaos["carregando"] = False
+
+
+def iniciar_lista_orgaos(chave):
+    with _orgaos_lock:
+        if _orgaos["lista"] is not None or _orgaos["carregando"]:
+            return
+        _orgaos["carregando"] = True
+        _orgaos["paginas"] = 0
+    threading.Thread(target=_baixar_orgaos, args=(chave,), daemon=True).start()
+
+
+def lista_orgaos_siafi(chave, espera=25):
+    iniciar_lista_orgaos(chave)
+    fim = time.time() + espera
+    while _orgaos["lista"] is None and _orgaos["carregando"] and time.time() < fim:
+        time.sleep(1)
+    return _orgaos["lista"]
+
+
+def limpar_nome_siafi(d):
+    return re.sub(r"\s*-\s*unidades com vinculo direto\s*$", "", norm(d))
+
+
+def achar_orgao_siafi(info, chave):
+    lista = lista_orgaos_siafi(chave)
+    if lista is None:
+        return "carregando", []
     nome = info["razao_social"]
     sigla = norm(info.get("nome_fantasia"))
-    termos = [nome]
-    if sigla and len(sigla) <= 15:
-        termos.append(info["nome_fantasia"])
-    longas = sorted(set(w for w in palavras(nome) if len(w) >= 5), key=len, reverse=True)
-    termos += [w.upper() for w in longas[:4]]
-    vistos = {}
-    for termo in termos:
-        for c in portal_orgaos(termo, H):
-            vistos[str(c["codigo"])] = c
-        melhor = max(vistos.values(), key=lambda c: parecido(nome, c.get("descricao")), default=None)
-        if melhor and parecido(nome, melhor.get("descricao")) >= 0.8:
-            break
-        time.sleep(0.3)
-    if not vistos:
+
+    def nota(c):
+        d = limpar_nome_siafi(c.get("descricao"))
+        return parecido(nome, d) + (0.3 if sigla and len(sigla) >= 3 and re.search(r"\b" + re.escape(sigla) + r"\b", d) else 0)
+
+    ordem = sorted(lista, key=nota, reverse=True)[:6]
+    if not ordem:
         return None, []
-    ordem = sorted(vistos.values(), key=lambda c: (parecido(nome, c.get("descricao"))
-                                                    + (0.3 if sigla and sigla in norm(c.get("descricao")) else 0)),
-                   reverse=True)
-    alvo = ordem[0]
-    nota = parecido(nome, alvo.get("descricao")) + (0.3 if sigla and sigla in norm(alvo.get("descricao")) else 0)
-    return (alvo if nota >= 0.55 else None), ordem[:6]
+    return (ordem[0] if nota(ordem[0]) >= 0.55 else None), ordem
 
 
 def federal(info, chave):
     H = {"chave-api-dados": chave}
     nome = info["razao_social"]
-    try:
-        alvo, candidatos = cached("siafi" + info["cnpj"], 86400, lambda: achar_orgao_siafi(info, H))
-    except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
-            return {"erro": "A chave do Portal da Transparência foi recusada. Confira se copiou a chave certa."}
-        return {"erro": f"Portal da Transparência respondeu {erro_txt(e)}."}
-    except Exception as e:
-        return {"erro": f"Portal da Transparência indisponível: {erro_txt(e)}."}
+    alvo, candidatos = achar_orgao_siafi(info, chave)
+    if alvo == "carregando":
+        if _orgaos["erro"]:
+            return {"erro": f"Não consegui baixar a lista de órgãos do Portal da Transparência ({_orgaos['erro']})."}
+        return {"erro": "Estou baixando a lista de órgãos federais do Portal da Transparência pela primeira vez "
+                        f"(página {_orgaos['paginas']}). Isso leva de 1 a 3 minutos. Consulte de novo daqui a pouco."}
     if not alvo:
         parecidos = "; ".join(f"{c.get('codigo')} {c.get('descricao')}" for c in candidatos[:4])
         return {"erro": f"Não encontrei '{nome}' na lista de órgãos do SIAFI."
@@ -777,41 +814,28 @@ def diagnostico_federal(cnpj):
     H = {"chave-api-dados": chave}
     info = consulta_cnpj(digitos(cnpj))
     linhas = [f"DIAGNOSTICO FEDERAL {info['cnpj']} {info['razao_social']} ({info.get('nome_fantasia')})", ""]
-    testes = [{"pagina": 1}, {"descricao": info["razao_social"], "pagina": 1}]
-    if info.get("nome_fantasia"):
-        testes.append({"descricao": info["nome_fantasia"], "pagina": 1})
-    for w in sorted(set(w for w in palavras(info["razao_social"]) if len(w) >= 5), key=len, reverse=True)[:3]:
-        testes.append({"descricao": w.upper(), "pagina": 1})
-    for t in testes:
-        url = f"{PORTAL}/orgaos-siafi?" + urllib.parse.urlencode(t)
-        try:
-            r = http_get(url, H)
-            linhas.append(f"== orgaos-siafi {t}: {len(r or [])} itens")
-            for c in (r or [])[:8]:
-                linhas.append("   " + json.dumps(c, ensure_ascii=False)[:300])
-        except Exception as e:
-            linhas.append(f"== orgaos-siafi {t}: ERRO {erro_txt(e)}")
-        time.sleep(0.4)
-    try:
-        alvo, cands = achar_orgao_siafi(info, H)
-        linhas.append("")
-        linhas.append("ESCOLHIDO: " + (json.dumps(alvo, ensure_ascii=False) if alvo else "nenhum"))
-        for c in cands:
-            linhas.append(f"   {parecido(info['razao_social'], c.get('descricao')):.2f}  {c.get('codigo')} {c.get('descricao')}")
-        if alvo:
-            ano = date.today().year - 1
-            for param in ("orgao", "orgaoSuperior"):
-                url = f"{PORTAL}/despesas/por-orgao?" + urllib.parse.urlencode({"ano": ano, param: alvo["codigo"], "pagina": 1})
-                try:
-                    r = http_get(url, H)
-                    linhas.append(f"== despesas/por-orgao {param}={alvo['codigo']} ano={ano}: {len(r or [])} itens")
-                    for c in (r or [])[:5]:
-                        linhas.append("   " + json.dumps(c, ensure_ascii=False)[:400])
-                except Exception as e:
-                    linhas.append(f"== despesas/por-orgao {param}: ERRO {erro_txt(e)}")
-                time.sleep(0.4)
-    except Exception as e:
-        linhas.append("busca: ERRO " + erro_txt(e))
+    lista = lista_orgaos_siafi(chave, espera=20)
+    linhas.append(f"Lista de órgãos: {'pronta, ' + str(len(lista)) + ' órgãos' if lista is not None else 'baixando'}"
+                  f" (páginas lidas: {_orgaos['paginas']}) {('erro: ' + _orgaos['erro']) if _orgaos['erro'] else ''}")
+    if lista is None:
+        linhas.append("Abra esta página de novo em 1 ou 2 minutos.")
+        return "\n".join(linhas)
+    alvo, cands = achar_orgao_siafi(info, chave)
+    linhas.append("ESCOLHIDO: " + (json.dumps(alvo, ensure_ascii=False) if alvo else "nenhum"))
+    for c in cands:
+        linhas.append(f"   {parecido(info['razao_social'], limpar_nome_siafi(c.get('descricao'))):.2f}  {c.get('codigo')} {c.get('descricao')}")
+    if alvo:
+        ano = date.today().year - 1
+        for param in ("orgao", "orgaoSuperior"):
+            url = f"{PORTAL}/despesas/por-orgao?" + urllib.parse.urlencode({"ano": ano, param: alvo["codigo"], "pagina": 1})
+            try:
+                r = http_get(url, H)
+                linhas.append(f"== despesas/por-orgao {param}={alvo['codigo']} ano={ano}: {len(r or [])} itens")
+                for c in (r or [])[:5]:
+                    linhas.append("   " + json.dumps(c, ensure_ascii=False)[:400])
+            except Exception as e:
+                linhas.append(f"== despesas/por-orgao {param}: ERRO {erro_txt(e)}")
+            time.sleep(0.5)
     return "\n".join(linhas)
 
 
@@ -1244,6 +1268,8 @@ function render(d) {
 def main():
     na_nuvem = "PORT" in os.environ or "--publico" in sys.argv
     srv = ThreadingHTTPServer(("0.0.0.0" if na_nuvem else "127.0.0.1", PORT), Handler)
+    if os.environ.get("PORTAL_TRANSPARENCIA_CHAVE"):
+        iniciar_lista_orgaos(os.environ["PORTAL_TRANSPARENCIA_CHAVE"])
     url = f"http://localhost:{PORT}"
     print(f"\n  Consulta Pagador Público rodando em {url}\n  (feche esta janela ou aperte Ctrl+C para parar)\n")
     if not na_nuvem and "--sem-navegador" not in sys.argv:
