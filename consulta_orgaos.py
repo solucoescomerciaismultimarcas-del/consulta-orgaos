@@ -1139,6 +1139,8 @@ p{{margin:0 0 20px;color:#94a3bb;font-size:14px;text-align:center}}
 label{{display:block;font-size:13px;font-weight:600;color:#94a3bb;margin-bottom:6px}}
 input{{width:100%;box-sizing:border-box;font:inherit;padding:12px 14px;border-radius:10px;border:1px solid #31415f;background:#0d1422;color:#e8eef8}}
 input:focus{{outline:2px solid #38bdf8;border-color:#38bdf8}}
+input:-webkit-autofill,input:-webkit-autofill:hover,input:-webkit-autofill:focus{{-webkit-box-shadow:0 0 0 1000px #0d1422 inset!important;box-shadow:0 0 0 1000px #0d1422 inset!important;-webkit-text-fill-color:#e8eef8!important;caret-color:#e8eef8;transition:background-color 9999s ease-out 0s}}
+html{{color-scheme:dark}}
 .sw{{position:relative}} .sw input{{padding-right:48px}}
 .olho{{position:absolute;right:6px;top:50%;transform:translateY(-50%);width:38px!important;height:38px;margin:0!important;padding:0!important;border-radius:8px!important;background:transparent!important;font-size:18px;line-height:1;cursor:pointer}}
 .olho:hover{{background:#26344f!important}}
