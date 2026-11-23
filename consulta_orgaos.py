@@ -1139,13 +1139,18 @@ p{{margin:0 0 20px;color:#94a3bb;font-size:14px;text-align:center}}
 label{{display:block;font-size:13px;font-weight:600;color:#94a3bb;margin-bottom:6px}}
 input{{width:100%;box-sizing:border-box;font:inherit;padding:12px 14px;border-radius:10px;border:1px solid #31415f;background:#0d1422;color:#e8eef8}}
 input:focus{{outline:2px solid #38bdf8;border-color:#38bdf8}}
+.sw{{position:relative}} .sw input{{padding-right:48px}}
+.olho{{position:absolute;right:6px;top:50%;transform:translateY(-50%);width:38px!important;height:38px;margin:0!important;padding:0!important;border-radius:8px!important;background:transparent!important;font-size:18px;line-height:1;cursor:pointer}}
+.olho:hover{{background:#26344f!important}}
 button{{width:100%;margin-top:14px;font:inherit;font-weight:800;padding:12px;border:0;border-radius:10px;background:#38bdf8;color:#06243a;cursor:pointer}}
 .erro{{background:#371a1c;border:1px solid #7a2f2f;color:#f6766f;border-radius:10px;padding:10px 12px;font-size:14px;margin-bottom:14px}}
 </style></head><body><form class="box" method="post" action="/entrar">
-<img class="logo" src="{LOGO_ENTRAR}" alt="SigaLicita"><p>Área restrita. Entre com o seu usuário e senha.</p>
-{'<div class="erro">Usuário ou senha incorretos. Tente de novo.</div>' if erro else ''}
-<label for="u">Usuário</label><input id="u" name="usuario" autocomplete="username" autocapitalize="none" autofocus required>
-<label for="s" style="margin-top:12px">Senha</label><input id="s" name="senha" type="password" autocomplete="current-password" required>
+<img class="logo" src="{LOGO_ENTRAR}" alt="SigaLicita"><p>Área restrita. Entre com o seu e-mail e senha.</p>
+{'<div class="erro">E-mail ou senha incorretos. Tente de novo.</div>' if erro else ''}
+<label for="u">E-mail</label><input id="u" name="usuario" type="email" inputmode="email" autocomplete="username" autocapitalize="none" placeholder="seu@email.com" autofocus required>
+<label for="s" style="margin-top:12px">Senha</label>
+<div class="sw"><input id="s" name="senha" type="password" autocomplete="current-password" required>
+<button type="button" class="olho" id="olho" aria-label="Mostrar senha" title="Mostrar senha" onclick="var s=document.getElementById('s'),v=s.type==='password';s.type=v?'text':'password';this.setAttribute('aria-label',v?'Esconder senha':'Mostrar senha');this.title=this.getAttribute('aria-label');this.textContent=v?'🙈':'👁';">👁</button></div>
 <input type="hidden" name="volta" value="{e(_volta_segura(volta))}">
 <button type="submit">Entrar</button></form></body></html>"""
 
