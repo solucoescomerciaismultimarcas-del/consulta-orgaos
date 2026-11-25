@@ -1146,6 +1146,7 @@ html{{color-scheme:dark}}
 .sw{{position:relative}} .sw input{{padding-right:48px}}
 .olho{{position:absolute;right:6px;top:50%;transform:translateY(-50%);width:38px!important;height:38px;margin:0!important;padding:0!important;border-radius:8px!important;background:transparent!important;font-size:18px;line-height:1;cursor:pointer}}
 .olho:hover{{background:#26344f!important}}
+.olho{{color:#c9d5ea;display:grid;place-items:center}}.olho:hover{{color:#fff}}.olho .f,.olho.on .a{{display:none}}.olho.on .f{{display:block}}
 button{{width:100%;margin-top:14px;font:inherit;font-weight:800;padding:12px;border:0;border-radius:10px;background:#38bdf8;color:#06243a;cursor:pointer}}
 .erro{{background:#371a1c;border:1px solid #7a2f2f;color:#f6766f;border-radius:10px;padding:10px 12px;font-size:14px;margin-bottom:14px}}
 </style></head><body><form class="box" method="post" action="/entrar">
@@ -1154,7 +1155,7 @@ button{{width:100%;margin-top:14px;font:inherit;font-weight:800;padding:12px;bor
 <label for="u">E-mail</label><input id="u" name="usuario" type="email" inputmode="email" autocomplete="username" autocapitalize="none" placeholder="seu@email.com" autofocus required>
 <label for="s" style="margin-top:12px">Senha</label>
 <div class="sw"><input id="s" name="senha" type="password" autocomplete="current-password" required>
-<button type="button" class="olho" id="olho" aria-label="Mostrar senha" title="Mostrar senha" onclick="var s=document.getElementById('s'),v=s.type==='password';s.type=v?'text':'password';this.setAttribute('aria-label',v?'Esconder senha':'Mostrar senha');this.title=this.getAttribute('aria-label');this.textContent=v?'🙈':'👁';">👁</button></div>
+<button type="button" class="olho" id="olho" aria-label="Mostrar senha" title="Mostrar senha" onclick="var s=document.getElementById('s'),v=s.type==='password';s.type=v?'text':'password';this.setAttribute('aria-label',v?'Esconder senha':'Mostrar senha');this.title=this.getAttribute('aria-label');this.classList.toggle('on',v);"><svg class="a" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg><svg class="f" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.6 5.1A10 10 0 0 1 12 5c6.5 0 10 7 10 7a17 17 0 0 1-2.6 3.5M6.6 6.6C3.7 8.4 2 12 2 12s3.5 7 10 7a9.6 9.6 0 0 0 5.4-1.6M9.9 9.9a3 3 0 0 0 4.2 4.2"/><path d="M2 2l20 20"/></svg></button></div>
 <input type="hidden" name="volta" value="{e(_volta_segura(volta))}">
 <button type="submit">Entrar</button></form></body></html>"""
 
